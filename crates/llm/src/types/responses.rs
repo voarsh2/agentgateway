@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 
 use self::typed::{
 	EasyInputContent, EasyInputMessage, InputContent, InputItem, InputMessage, InputRole,
@@ -343,6 +343,24 @@ impl From<SimpleChatCompletionMessage> for InputItem {
 }
 
 impl Request {
+	fn is_valid_id(id: &str, prefix: &str) -> bool {
+		id.starts_with(prefix)
+			&& id.len() <= 64
+			&& id
+				.bytes()
+			.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+	}
+
+	fn bounded_id(prefix: &str, original: &str) -> String {
+		// Hex is deliberately used instead of base64url: it only contains
+		// letters and digits, which is accepted by stricter OpenAI-compatible
+		// providers as well as the documented Responses ID character set.
+		let digest = Sha256::digest(original.as_bytes());
+		let encoded = format!("{digest:x}");
+		let suffix_len = 64usize.saturating_sub(prefix.len());
+		format!("{prefix}{}", &encoded[..suffix_len.min(encoded.len())])
+	}
+
 	/// Canonicalize tool-call *item* IDs before sending a Responses request
 	/// to an upstream provider.
 	///
@@ -356,15 +374,16 @@ impl Request {
 	/// a suffix: strict providers also cap item IDs at 64 characters, while
 	/// compatible providers can emit longer IDs.
 	///
-	/// `call_id` deliberately remains unchanged: it is the stable linkage
-	/// between a tool call and its corresponding output, while `id` identifies
-	/// the Responses item itself.
+	/// `call_id` values are normalized only when they exceed the strict provider
+	/// limit or contain unsupported characters. A deterministic mapping is then
+	/// applied to every matching tool output so the linkage remains intact.
 	pub fn canonicalize_tool_call_item_ids(&mut self) -> usize {
 		let RequestInput::Items(items) = &mut self.input else {
 			return 0;
 		};
 
 		let mut normalized = 0;
+		let mut call_id_map = HashMap::new();
 		for RawInputItem(item) in items {
 			let Some(item) = item.as_object_mut() else {
 				continue;
@@ -372,22 +391,49 @@ impl Request {
 			let expected_prefix = match item.get("type").and_then(Value::as_str) {
 				Some("function_call") => "fc_",
 				Some("custom_tool_call") => "ctc_",
+				Some("web_search_call") => "ws_",
 				_ => continue,
 			};
-			let Some(id) = item.get("id").and_then(Value::as_str) else {
+			let Some(id) = item.get("id").and_then(Value::as_str).map(str::to_string) else {
 				continue;
 			};
-			if id.starts_with(expected_prefix) && id.len() <= 64 {
-				continue;
+			if !Self::is_valid_id(&id, expected_prefix) {
+				item.insert(
+					"id".to_string(),
+					Value::String(Self::bounded_id(expected_prefix, &id)),
+				);
+				normalized += 1;
 			}
 
-			// A SHA-256 digest encoded as unpadded base64url is 43 characters.
-			// With either expected prefix the generated identifier remains safely
-			// below the 64-character Responses API limit.
-			let digest = Sha256::digest(id.as_bytes());
-			let canonical_id = format!("{expected_prefix}{}", URL_SAFE_NO_PAD.encode(digest));
-			item.insert("id".to_string(), Value::String(canonical_id));
-			normalized += 1;
+		}
+
+		// Collect call IDs from both tool calls and tool outputs. Outputs may be
+		// the only item retained after context trimming, so the map cannot depend
+		// on seeing the originating call first.
+		for RawInputItem(item) in items.iter() {
+			let Some(call_id) = item.get("call_id").and_then(Value::as_str) else {
+				continue;
+			};
+			if !Self::is_valid_id(call_id, "call_") {
+				call_id_map
+					.entry(call_id.to_string())
+					.or_insert_with(|| Self::bounded_id("call_", call_id));
+			}
+		}
+
+		if !call_id_map.is_empty() {
+			for RawInputItem(item) in items {
+				let Some(object) = item.as_object_mut() else {
+					continue;
+				};
+				let Some(call_id) = object.get("call_id").and_then(Value::as_str) else {
+					continue;
+				};
+				if let Some(mapped) = call_id_map.get(call_id) {
+					object.insert("call_id".to_string(), Value::String(mapped.clone()));
+					normalized += 1;
+				}
+			}
 		}
 		normalized
 	}
@@ -746,8 +792,10 @@ mod tests {
 		let id = body["input"][0]["id"].as_str().expect("custom-tool item ID");
 		assert!(id.starts_with("ctc_"));
 		assert!(id.len() <= 64);
-		assert_eq!(body["input"][0]["call_id"], "call_t2_correlation");
-		assert_eq!(body["input"][1]["call_id"], "call_t2_correlation");
+		let call_id = body["input"][0]["call_id"].as_str().expect("call ID");
+		assert!(call_id.starts_with("call_"));
+		assert!(call_id.len() <= 64);
+		assert_eq!(body["input"][1]["call_id"], call_id);
 		let id = body["input"][2]["id"].as_str().expect("function-call item ID");
 		assert!(id.starts_with("fc_"));
 		assert!(id.len() <= 64);
