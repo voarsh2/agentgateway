@@ -356,7 +356,10 @@ impl Request {
 		// letters and digits, which is accepted by stricter OpenAI-compatible
 		// providers as well as the documented Responses ID character set.
 		let digest = Sha256::digest(original.as_bytes());
-		let encoded = format!("{digest:x}");
+		let encoded = digest
+			.iter()
+			.map(|byte| format!("{byte:02x}"))
+			.collect::<String>();
 		let suffix_len = 64usize.saturating_sub(prefix.len());
 		format!("{prefix}{}", &encoded[..suffix_len.min(encoded.len())])
 	}
@@ -384,7 +387,7 @@ impl Request {
 
 		let mut normalized = 0;
 		let mut call_id_map = HashMap::new();
-		for RawInputItem(item) in items {
+		for RawInputItem(item) in items.iter_mut() {
 			let Some(item) = item.as_object_mut() else {
 				continue;
 			};
@@ -422,7 +425,7 @@ impl Request {
 		}
 
 		if !call_id_map.is_empty() {
-			for RawInputItem(item) in items {
+			for RawInputItem(item) in items.iter_mut() {
 				let Some(object) = item.as_object_mut() else {
 					continue;
 				};
