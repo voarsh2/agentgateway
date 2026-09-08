@@ -2458,6 +2458,7 @@ fn traffic_policy_from_proto(
 			};
 			TrafficPolicy::Retry(http::retry::Policy {
 				attempts,
+				max_buffer_size: None,
 				backoff,
 				codes: codes.into_boxed_slice(),
 				precondition,

@@ -16,6 +16,10 @@ pub struct Policy {
 	/// Total number of attempts, including the original request.
 	#[serde(default = "default_attempts")]
 	pub attempts: NonZeroU8,
+	/// Maximum request-body size buffered for replay. When unset, the proxy
+	/// retains its conservative default replay limit.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub max_buffer_size: Option<usize>,
 	/// Delay between retry attempts.
 	#[serde(
 		default,
@@ -75,12 +79,14 @@ mod tests {
 	fn parses_pre_and_post_conditions() {
 		let pol: Policy = serde_json::from_value(serde_json::json!({
 			"attempts": 3,
+			"maxBufferSize": 1024,
 			"codes": [503],
 			"precondition": "request.method == \"GET\"",
 			"condition": "response.headers[\"x-req-failed\"] != \"\"",
 		}))
 		.unwrap();
 		assert_eq!(pol.attempts.get(), 3);
+		assert_eq!(pol.max_buffer_size, Some(1024));
 		assert_eq!(
 			pol.precondition.as_ref().unwrap().original_expression,
 			"request.method == \"GET\""

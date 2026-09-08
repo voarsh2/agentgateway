@@ -980,8 +980,12 @@ impl HTTPProxy {
 				}
 			});
 		}
-		const MAX_BUFFERED_BYTES: usize = 64 * 1024;
 		let retries = route_retry;
+		let max_buffered_bytes = retries
+			.as_ref()
+			.and_then(|retry| retry.max_buffer_size)
+			.filter(|size| *size < usize::MAX)
+			.unwrap_or(64 * 1024);
 
 		// LLM token rate limiting reuses the rate-limit policy selected above in the normal
 		// request-policy flow. Conditional rate-limit expressions are evaluated only once there;
@@ -990,8 +994,9 @@ impl HTTPProxy {
 		llm_request_policies.llm = route_llm;
 		let llm_request_policies = Arc::new(llm_request_policies);
 
-		// attempts is the total number of attempts, not the retries
-		let attempts = retries.as_ref().map(|r| r.attempts.get() + 1).unwrap_or(1);
+		// attempts is the total number of attempts, including the original request.
+		// Preserve this semantics for existing xDS and route retry policies.
+		let attempts = retries.as_ref().map(|r| r.attempts.get()).unwrap_or(1);
 		let retry_backoff = retries.as_ref().and_then(|r| r.backoff);
 		let request_timeout = response_policies
 			.timeout
@@ -999,7 +1004,7 @@ impl HTTPProxy {
 			.and_then(|t| t.request_timeout);
 		let body = if attempts > 1 {
 			// If we are going to attempt a retry we will need to track the incoming bytes for replay
-			let body = http::retry::ReplayBody::try_new(body, MAX_BUFFERED_BYTES);
+			let body = http::retry::ReplayBody::try_new(body, max_buffered_bytes);
 			if body.is_err() {
 				debug!("initial body is too large to retry, disabling retries")
 			}
@@ -3206,6 +3211,7 @@ mod tests {
 	fn retry_policy(codes: &[u16], condition: Option<&str>) -> crate::http::retry::Policy {
 		crate::http::retry::Policy {
 			attempts: std::num::NonZeroU8::new(2).unwrap(),
+			max_buffer_size: None,
 			backoff: None,
 			codes: codes
 				.iter()
@@ -3679,7 +3685,7 @@ mod tests {
 		bind
 			.attach_route_policy(json!({
 				"retry": {
-					"attempts": 1,
+					"attempts": 2,
 					"backoff": "10ms",
 					"codes": [429]
 				},

@@ -2314,6 +2314,9 @@ enum LocalBackendAuthKind {
 struct LocalLLMPolicy {
 	#[serde(flatten)]
 	gateway: LocalGatewayPolicy,
+	/// Retry failed LLM requests before returning the upstream error.
+	#[serde(default)]
+	retry: Option<retry::Policy>,
 	/// Guardrails to apply to every configured model.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	guardrails: Option<PromptGuard>,
@@ -4129,6 +4132,7 @@ async fn convert_llm_config(
 	let (listener_gateway_policies, listener_route_policies) = if let Some(pol) = policies {
 		let LocalLLMPolicy {
 			gateway,
+			retry,
 			guardrails,
 			local_rate_limit,
 			remote_rate_limit,
@@ -4138,6 +4142,7 @@ async fn convert_llm_config(
 		let feature_route_policies = split_policies(
 			resources,
 			FilterOrPolicy {
+				retry,
 				local_rate_limit: (!local_rate_limit.is_empty())
 					.then_some(LocalRateLimitPolicy::Explicit(local_rate_limit)),
 				remote_rate_limit: remote_rate_limit.map(LocalExplicitOrConditional::Explicit),
