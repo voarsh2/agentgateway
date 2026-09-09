@@ -1327,6 +1327,7 @@ pub mod to_completions {
 			let chunk = match ev {
 				parse::sse::SseJsonEvent::Data(Ok(c)) => c,
 				parse::sse::SseJsonEvent::Data(Err(e)) => {
+					log.mark_failed();
 					tracing::debug!("failed to parse gemini stream chunk: {e}");
 					return vec![];
 				},

@@ -419,6 +419,7 @@ impl ResponseType for Response {
 		};
 
 		LLMResponse {
+			failed: false,
 			input_tokens: Some(self.usage.input_tokens),
 			input_image_tokens: None,
 			input_text_tokens: None,
@@ -1178,6 +1179,7 @@ pub mod typed {
 			};
 
 			crate::LLMResponse {
+				failed: false,
 				input_tokens: Some(self.usage.input_tokens as u64),
 				input_image_tokens: None,
 				input_text_tokens: None,

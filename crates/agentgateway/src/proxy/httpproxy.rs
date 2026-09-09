@@ -1072,6 +1072,7 @@ impl HTTPProxy {
 					&res,
 					retries.as_ref().unwrap(),
 					log.request_snapshot.as_deref(),
+					log.attempt_provider_failed.load().unwrap_or(false),
 				) {
 				if !last {
 					debug!("response not retry-able");
@@ -1327,6 +1328,9 @@ impl HTTPProxy {
 		response_policies: &mut ResponsePolicies,
 		mut req: Request,
 	) -> Result<Response, SnapshottedProxyResponse> {
+		// Retry classification belongs to this attempt. Keep the request-level marker
+		// monotonic so a late stream failure can still evict the provider.
+		log.attempt_provider_failed.store(Some(false));
 		if let Some(backend_timeout) = response_policies
 			.timeout
 			.as_ref()
@@ -2590,6 +2594,7 @@ async fn make_backend_call(
 	dtrace::trace(|trace| trace.backend_call_started(&call.target));
 	let upstream = inputs.upstream.clone();
 	let llm_response_log = log.as_ref().map(|l| l.llm_response.clone());
+	let attempt_provider_failed = log.as_ref().map(|l| l.attempt_provider_failed.clone());
 	let log_content = log
 		.as_ref()
 		.map(|l| llm::LogContentFields {
@@ -2662,6 +2667,7 @@ async fn make_backend_call(
 			l.a2a_response = Some(a2a_response);
 		});
 	}
+	let upstream_status = resp.status();
 	let mut resp = if let (Some(llm), Some(llm_request)) = (
 		backend_call.backend_policies.llm_provider.clone(),
 		llm_request,
@@ -2677,12 +2683,24 @@ async fn make_backend_call(
 					llm_response_log.expect("must be set"),
 					log_content,
 					Some(&inputs.model_catalog),
+					attempt_provider_failed.expect("must be set"),
 					resp,
 				)
 				.assert_size::<{ 4 * 1024 }>(),
 		)
 		.await
-		.map_err(ProxyError::AI)?
+		.map_err(|e| {
+			// A successful provider response that cannot be translated is still a
+			// provider-side failure for health/failover purposes. The marker also lets
+			// the retry loop recognize this otherwise-AI error before it becomes a
+			// client-visible response.
+			if upstream_status.is_success()
+				&& let Some(log) = log.as_ref()
+			{
+				log.attempt_provider_failed.store(Some(true));
+			}
+			ProxyError::AI(e)
+		})?
 	} else {
 		resp
 	};
@@ -3162,7 +3180,11 @@ fn should_retry(
 	res: &Result<Response, SnapshottedProxyResponse>,
 	pol: &retry::Policy,
 	req_snapshot: Option<&cel::RequestSnapshot>,
+	provider_failed: bool,
 ) -> bool {
+	if provider_failed {
+		return true;
+	}
 	match res {
 		Ok(resp) => {
 			if pol.codes.contains(&resp.status()) {
@@ -3305,14 +3327,14 @@ mod tests {
 			.status(503)
 			.body(http::Body::empty())
 			.unwrap();
-		assert!(super::should_retry(&Ok(resp), &pol, None));
+		assert!(super::should_retry(&Ok(resp), &pol, None, false));
 
 		let pol = retry_policy(&[503], None);
 		let resp = ::http::Response::builder()
 			.status(200)
 			.body(http::Body::empty())
 			.unwrap();
-		assert!(!super::should_retry(&Ok(resp), &pol, None));
+		assert!(!super::should_retry(&Ok(resp), &pol, None, false));
 	}
 
 	#[test]
@@ -3324,14 +3346,53 @@ mod tests {
 			.header("x-req-failed", "true")
 			.body(http::Body::empty())
 			.unwrap();
-		assert!(super::should_retry(&Ok(failed), &pol, None));
+		assert!(super::should_retry(&Ok(failed), &pol, None, false));
 
 		let pol = retry_policy(&[], Some(r#"response.headers["x-req-failed"] == "true""#));
 		let ok = ::http::Response::builder()
 			.status(200)
 			.body(http::Body::empty())
 			.unwrap();
-		assert!(!super::should_retry(&Ok(ok), &pol, None));
+		assert!(!super::should_retry(&Ok(ok), &pol, None, false));
+	}
+
+	#[test]
+	fn should_retry_condition_matches_buffered_200_body() {
+		let pol = retry_policy(
+			&[],
+			Some(r#"string(response.body).contains("model service not available")"#),
+		);
+		let mut failed = ::http::Response::builder()
+			.status(200)
+			.body(http::Body::empty())
+			.unwrap();
+		failed
+			.extensions_mut()
+			.insert(crate::cel::BufferedBody::complete(
+				bytes::Bytes::from_static(b"model service not available"),
+			));
+		assert!(super::should_retry(&Ok(failed), &pol, None, false));
+
+		let mut ok = ::http::Response::builder()
+			.status(200)
+			.body(http::Body::empty())
+			.unwrap();
+		ok.extensions_mut()
+			.insert(crate::cel::BufferedBody::complete(
+				bytes::Bytes::from_static(b"completed"),
+			));
+		assert!(!super::should_retry(&Ok(ok), &pol, None, false));
+	}
+
+	#[test]
+	fn should_retry_provider_failure_is_attempt_scoped() {
+		let pol = retry_policy(&[], None);
+		let resp = ::http::Response::builder()
+			.status(200)
+			.body(http::Body::empty())
+			.unwrap();
+		assert!(super::should_retry(&Ok(resp.clone()), &pol, None, true));
+		assert!(!super::should_retry(&Ok(resp), &pol, None, false));
 	}
 
 	#[test]

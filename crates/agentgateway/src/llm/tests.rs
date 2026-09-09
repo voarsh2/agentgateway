@@ -1690,6 +1690,7 @@ async fn process_response_routes_streaming_error_to_buffered_path() {
 			AsyncLog::default(),
 			llm::LogContentFields::default(),
 			None,
+			AsyncLog::default(),
 			resp,
 		)
 		.await
@@ -1829,6 +1830,7 @@ async fn process_streaming_bedrock_completions_normalizes_sse_headers_and_done()
 			AsyncLog::default(),
 			llm::LogContentFields::default(),
 			None,
+			AsyncLog::default(),
 			resp,
 		)
 		.expect("Bedrock streaming translation should succeed");
@@ -2457,6 +2459,41 @@ async fn responses_passthrough_stream_captures_completion_and_tool_calls() {
 		tool_calls[0].arguments,
 		serde_json::json!({"location": "San Francisco"})
 	);
+}
+
+#[tokio::test]
+async fn responses_passthrough_stream_marks_malformed_provider_data_failed() {
+	let body = Body::from(
+		b"event: response.created\ndata: {not-json}\n\n".to_vec(),
+	);
+	let log = AsyncLog::default();
+	log.store(Some(LLMInfo {
+		request: LLMRequest {
+			input_tokens: None,
+			input_format: InputFormat::Responses,
+			cache_convention: CacheTokenConvention::pending(),
+			request_model: "gpt-5.6-terra".into(),
+			provider: "openai".into(),
+			streaming: true,
+			params: Default::default(),
+			prompt: None,
+			provider_state: None,
+		},
+		response: LLMResponse::default(),
+	}));
+	let marker = AsyncLog::default();
+	let marker_copy = marker.clone();
+	let logger = AmendOnDrop::new(log, LLMResponsePolicies::default(), None, None)
+		.with_failure_marker(marker)
+		.into_llm();
+	let translated = conversion::responses::passthrough_stream(
+		body,
+		1024,
+		logger,
+		llm::LogContentFields::default(),
+	);
+	let _ = translated.collect().await.unwrap();
+	assert_eq!(marker_copy.load(), Some(true));
 }
 
 #[tokio::test]

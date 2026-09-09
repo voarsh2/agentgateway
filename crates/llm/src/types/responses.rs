@@ -407,7 +407,6 @@ impl Request {
 				);
 				normalized += 1;
 			}
-
 		}
 
 		// Collect call IDs from both tool calls and tool outputs. Outputs may be
@@ -620,6 +619,7 @@ impl ResponseType for Response {
 		};
 
 		LLMResponse {
+			failed: false,
 			input_tokens: self.usage.as_ref().map(|u| u.input_tokens),
 			input_image_tokens: None,
 			input_text_tokens: None,

@@ -517,6 +517,7 @@ pub mod from_messages {
 					return events;
 				},
 				SseJsonEvent::Data(Err(e)) => {
+					log.mark_failed();
 					tracing::debug!(
 						"Failed to parse OpenAI stream response during translation: {}",
 						e
@@ -1281,6 +1282,7 @@ pub fn passthrough_stream(
 						}
 					},
 					Some(Err(e)) => {
+						log.mark_failed();
 						debug!("failed to parse streaming response: {e}");
 					},
 					None => {

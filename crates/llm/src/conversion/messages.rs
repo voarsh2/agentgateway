@@ -901,19 +901,25 @@ pub fn passthrough_stream(
 	// https://platform.claude.com/docs/en/build-with-claude/streaming
 	parse::sse::json_passthrough::<messages::MessagesStreamEvent>(b, buffer_limit, move |f| {
 		// ignore errors... what else can we do?
-		let Some(Ok(f)) = f else {
+		let Some(f) = f else {
 			// Stream ended ([DONE]): flush completion if not already set via MessageDelta
-			if f.is_none() {
-				log.update(|r| {
-					if let Some(c) = completion.take() {
-						r.response.completion = Some(vec![c]);
-					}
-					if r.response.output_messages.is_none() {
-						r.response.output_messages = tool_calls.take_output_messages(None);
-					}
-				});
-			}
+			log.update(|r| {
+				if let Some(c) = completion.take() {
+					r.response.completion = Some(vec![c]);
+				}
+				if r.response.output_messages.is_none() {
+					r.response.output_messages = tool_calls.take_output_messages(None);
+				}
+			});
 			return;
+		};
+		let f = match f {
+			Ok(f) => f,
+			Err(e) => {
+				log.mark_failed();
+				tracing::debug!("failed to parse Messages API stream: {e}");
+				return;
+			},
 		};
 
 		// Extract info we need

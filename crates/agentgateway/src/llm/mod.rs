@@ -1932,6 +1932,7 @@ impl AIProvider {
 		log: AsyncLog<llm::LLMInfo>,
 		log_content: LogContentFields,
 		model_catalog: Option<&Arc<cost::ModelCatalog>>,
+		attempt_provider_failed: AsyncLog<bool>,
 		resp: Response,
 	) -> Result<Response, AIError> {
 		// Non-success responses are plain JSON, not event-stream data.
@@ -1946,6 +1947,7 @@ impl AIProvider {
 				log,
 				log_content,
 				model_catalog.cloned(),
+				attempt_provider_failed,
 				resp,
 			);
 		}
@@ -2069,12 +2071,14 @@ impl AIProvider {
 				.await
 				.map_err(|e| map_compression_error(e, &parts.headers))?;
 
-		// Snapshot decompressed bytes for CEL response.body access before re-compression,
-		// so maybe_buffer_response_body can skip decompression entirely.
+		// Snapshot decompressed bytes for CEL response.body access before re-compression.
+		// This is also needed by retry conditions: retry classification runs before the
+		// outer proxy has a chance to inspect the response body, including for ordinary
+		// uncompressed JSON responses.
+		parts
+			.extensions
+			.insert(crate::cel::BufferedBody::complete(bytes.clone()));
 		if encoding.is_some() {
-			parts
-				.extensions
-				.insert(crate::cel::BufferedBody::complete(bytes.clone()));
 			parts.headers.remove(header::CONTENT_ENCODING);
 			parts.headers.remove(header::TRANSFER_ENCODING);
 		}
@@ -2326,6 +2330,7 @@ impl AIProvider {
 		log: AsyncLog<llm::LLMInfo>,
 		log_content: LogContentFields,
 		model_catalog: Option<Arc<cost::ModelCatalog>>,
+		attempt_provider_failed: AsyncLog<bool>,
 		resp: Response,
 	) -> Result<Response, AIError> {
 		let model = req.request_model.clone();
@@ -2394,7 +2399,9 @@ impl AIProvider {
 			vec![]
 		};
 
-		let logger = AmendOnDrop::new(log, response_policies, req_snapshot, model_catalog).into_llm();
+		let logger = AmendOnDrop::new(log, response_policies, req_snapshot, model_catalog)
+			.with_failure_marker(attempt_provider_failed)
+			.into_llm();
 		let stream_format = match self {
 			AIProvider::Bedrock(_) => "awsEventStream",
 			_ => "sseJson",
@@ -2654,6 +2661,7 @@ fn amend_tokens(rate_limit: store::LLMResponsePolicies, llm_resp: &LLMInfo, exec
 
 pub struct AmendOnDrop {
 	log: AsyncLog<llm::LLMInfo>,
+	failure_marker: Option<AsyncLog<bool>>,
 	pol: Option<LLMResponsePolicies>,
 	req: Option<Arc<RequestSnapshot>>,
 	catalog: Option<Arc<cost::ModelCatalog>>,
@@ -2668,10 +2676,16 @@ impl AmendOnDrop {
 	) -> Self {
 		Self {
 			log,
+			failure_marker: None,
 			pol: Some(pol),
 			req,
 			catalog,
 		}
+	}
+
+	pub fn with_failure_marker(mut self, marker: AsyncLog<bool>) -> Self {
+		self.failure_marker = Some(marker);
+		self
 	}
 	pub fn non_atomic_mutate(&self, f: impl FnOnce(&mut llm::LLMInfo)) {
 		self.log.non_atomic_mutate(f);
@@ -2696,6 +2710,15 @@ impl AmendOnDrop {
 impl agent_llm::StreamingUsageReporter for AmendOnDrop {
 	fn update(&self, f: &mut dyn FnMut(&mut llm::LLMInfo)) {
 		self.log.non_atomic_mutate(|info| f(info));
+	}
+
+	fn mark_failed(&self) {
+		if let Some(marker) = &self.failure_marker {
+			marker.store(Some(true));
+		}
+		self
+			.log
+			.non_atomic_mutate(|info| info.response.failed = true);
 	}
 
 	fn report_usage(&mut self) {

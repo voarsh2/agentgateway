@@ -497,6 +497,7 @@ impl ResponseType for Response {
 		let output_tokens = self.lookup(lookups::USAGE_OUTPUT_TOKENS, |v| v.as_u64());
 		let total_tokens = self.lookup(lookups::USAGE_TOTAL_TOKENS, |v| v.as_u64());
 		crate::LLMResponse {
+			failed: false,
 			count_tokens: None, // We never tokenize these, so always empty
 			input_tokens,
 			input_image_tokens: self.lookup(lookups::INPUT_IMAGE_TOKENS, |v| v.as_u64()),
@@ -675,6 +676,7 @@ pub fn passthrough_stream(
 				amend_from_stream_response(&mut log, &f);
 			},
 			Some(Err(e)) => {
+				log.mark_failed();
 				debug!("failed to parse streaming response: {e}");
 			},
 			None => {},

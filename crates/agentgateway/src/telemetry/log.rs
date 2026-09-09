@@ -675,6 +675,12 @@ pub struct DropOnLog {
 }
 
 impl DropOnLog {
+	pub fn mark_provider_failed(&mut self) {
+		if let Some(log) = self.log.as_ref() {
+			log.attempt_provider_failed.store(Some(true));
+		}
+	}
+
 	pub fn as_mut(&mut self) -> Option<&mut RequestLog> {
 		self.log.as_mut()
 	}
@@ -709,6 +715,13 @@ impl DropOnLog {
 		status: Option<crate::http::StatusCode>,
 		cel_exec: &CelLoggingExecutor<'_>,
 	) -> bool {
+		// A provider can return successful HTTP headers and fail later while the body is
+		// being consumed (or report an LLM-level failure in a 200 stream). This marker is
+		// deliberately checked before the configured expression so an expression such as
+		// `response.code == 429` cannot mask a transport/model failure.
+		if log.attempt_provider_failed.load().unwrap_or(false) {
+			return true;
+		}
 		let default_unhealthy = Self::default_unhealthy_for_status(log, status);
 		let Some(policy) = &log.health_policy else {
 			return default_unhealthy;
@@ -959,6 +972,7 @@ impl RequestLog {
 			outgoing_span: None,
 			llm_request: None,
 			llm_response: Default::default(),
+			attempt_provider_failed: Default::default(),
 			a2a_method: None,
 			a2a_response: None,
 			inference_pool: None,
@@ -1116,6 +1130,9 @@ pub struct RequestLog {
 
 	pub llm_request: Option<llm::LLMRequest>,
 	pub llm_response: AsyncLog<llm::LLMInfo>,
+	/// Marker for the currently active upstream attempt. This is reset before each retry
+	/// attempt so a successful fallback is not evicted because of an earlier provider failure.
+	pub attempt_provider_failed: AsyncLog<bool>,
 
 	pub a2a_method: Option<Strng>,
 	pub a2a_response: Option<a2a::ResponseInfo>,
@@ -1877,7 +1894,11 @@ where
 				}
 				Poll::Ready(Some(Ok(frame)))
 			},
-			res => Poll::Ready(res),
+			Some(Err(error)) => {
+				this.log.mark_provider_failed();
+				Poll::Ready(Some(Err(error)))
+			},
+			None => Poll::Ready(None),
 		}
 	}
 

@@ -29,19 +29,25 @@ pub fn passthrough_stream(
 	let mut completion = log_content.completion.then(String::new);
 	let mut tool_calls = log_content.tool_calls.then(BTreeMap::new);
 	parse::sse::json_passthrough::<StreamResponse>(b, buffer_limit, move |event| {
-		let Some(Ok(event)) = event else {
+		let Some(event) = event else {
 			// Stream ended ([DONE]): flush completion if not already set via ResponseCompleted
-			if event.is_none() {
-				log.update(|r| {
-					if let Some(c) = completion.take() {
-						r.response.completion = Some(vec![c]);
-					}
-					if r.response.output_messages.is_none() {
-						r.response.output_messages = take_output_messages(&mut tool_calls, None);
-					}
-				});
-			}
+			log.update(|r| {
+				if let Some(c) = completion.take() {
+					r.response.completion = Some(vec![c]);
+				}
+				if r.response.output_messages.is_none() {
+					r.response.output_messages = take_output_messages(&mut tool_calls, None);
+				}
+			});
 			return;
+		};
+		let event = match event {
+			Ok(event) => event,
+			Err(error) => {
+				log.mark_failed();
+				tracing::debug!("failed to parse Responses API stream: {error}");
+				return;
+			},
 		};
 		let event = match event {
 			StreamResponse::Typed(e) => e,
@@ -51,6 +57,10 @@ pub fn passthrough_stream(
 			},
 		};
 		match event {
+			types::responses::typed::ResponseStreamEvent::ResponseFailed(_)
+			| types::responses::typed::ResponseStreamEvent::ResponseError(_) => {
+				log.mark_failed();
+			},
 			types::responses::typed::ResponseStreamEvent::ResponseCreated(created) => {
 				log.update(|r| {
 					r.response.provider_model = Some(strng::new(&created.response.model));
