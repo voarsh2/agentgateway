@@ -17,7 +17,15 @@ struct TestCase {
 }
 
 // keep in sync with test_cases
-const TEST_CASE_NAMES: &[&str] = &["simple_access", "header", "bbr", "jwt", "cidr", "regex"];
+const TEST_CASE_NAMES: &[&str] = &[
+	"simple_access",
+	"header",
+	"bbr",
+	"json_merge",
+	"jwt",
+	"cidr",
+	"regex",
+];
 
 // Comprehensive test cases to be used across multiple tests
 fn test_cases() -> Vec<TestCase> {
@@ -64,6 +72,31 @@ fn test_cases() -> Vec<TestCase> {
 				)
 			},
 			expected: json!("gpt-4-turbo-preview"),
+		},
+		TestCase {
+			name: "json_merge",
+			expression: r#"json(request.body).with(b,
+				toJson(b.merge({"max_tokens": has(b.max_tokens) ? min(b.max_tokens, 128000) : 128000})))"#,
+			request_builder: || {
+				with_body(
+					::http::Request::builder()
+						.method(Method::POST)
+						.uri("http://example.com")
+						.header("content-type", "application/json")
+						.body(Body::from(
+							include_bytes!("../../../llm/src/tests/requests/completions/full.json").to_vec(),
+						))
+						.unwrap(),
+				)
+			},
+			expected: {
+				let mut body: serde_json::Value = serde_json::from_slice(include_bytes!(
+					"../../../llm/src/tests/requests/completions/full.json"
+				))
+				.unwrap();
+				body["max_tokens"] = json!(body["max_tokens"].as_u64().unwrap_or(128000).min(128000));
+				json!(body.to_string())
+			},
 		},
 		TestCase {
 			name: "cidr",
@@ -177,7 +210,7 @@ fn test_benchmark_cases_snapshot() {
 			.unwrap_or_else(|e| panic!("Failed to compile expression '{}': {}", tc.expression, e));
 		let mut req = (tc.request_builder)();
 		let ss = crate::cel::snapshot_request(&mut req, true);
-		let exec = crate::cel::Executor::new_logger(Some(&ss), None, None, None, None, None);
+		let exec = crate::cel::Executor::new_logger(Some(&ss), None, None, None, None, None, None);
 		let result = exec
 			.eval(&expr)
 			.unwrap_or_else(|e| panic!("Failed to eval expression '{}': {}", tc.expression, e));
@@ -220,7 +253,7 @@ fn bench_execute_snapshot(b: Bencher, case_name: &str) {
 	let expr = Expression::new_strict(tc.expression).unwrap();
 	let mut req = (tc.request_builder)();
 	let ss = crate::cel::snapshot_request(&mut req, true);
-	let exec = crate::cel::Executor::new_logger(Some(&ss), None, None, None, None, None);
+	let exec = crate::cel::Executor::new_logger(Some(&ss), None, None, None, None, None, None);
 
 	b.bench(|| {
 		let _ = divan::black_box(exec.eval(&expr).unwrap());

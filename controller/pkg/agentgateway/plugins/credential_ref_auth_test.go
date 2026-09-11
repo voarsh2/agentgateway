@@ -11,7 +11,6 @@ import (
 	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/util/assert"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/agentgateway/agentgateway/controller/api/v1alpha1/agentgateway"
@@ -182,27 +181,30 @@ func TestAzureAuthBuildsExplicitAndImplicitConfigs(t *testing.T) {
 	t.Run("workloadIdentity", func(t *testing.T) {
 		policy, err := buildAzureAuthPolicy(ctx, &agentgateway.AzureAuth{
 			WorkloadIdentity: &agentgateway.AzureWorkloadIdentity{},
+			Scopes:           []string{"https://graph.microsoft.com/.default"},
 		}, "default")
 		assert.NoError(t, err)
 		explicit := policy.GetAzure().GetExplicitConfig()
 		assert.Equal(t, explicit != nil, true)
 		assert.Equal(t, explicit.GetWorkloadIdentityCredential() != nil, true)
+		assert.Equal(t, policy.GetAzure().GetScopes(), []string{"https://graph.microsoft.com/.default"})
 	})
 
 	t.Run("implicit when no credential source is set", func(t *testing.T) {
-		policy, err := buildAzureAuthPolicy(ctx, &agentgateway.AzureAuth{}, "default")
+		policy, err := buildAzureAuthPolicy(ctx, &agentgateway.AzureAuth{
+			Scopes: []string{"https://graph.microsoft.com/.default"},
+		}, "default")
 		assert.NoError(t, err)
 		assert.Equal(t, policy.GetAzure().GetImplicit() != nil, true)
+		assert.Equal(t, policy.GetAzure().GetScopes(), []string{"https://graph.microsoft.com/.default"})
 	})
 }
 
 func TestBasicAuthCanUseInjectedCredentialResolver(t *testing.T) {
 	stop := test.NewStop(t)
 	configMap := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: "default",
-			Name:      "basic-auth",
-		},
+		Namespace: "default",
+		Name:      "basic-auth",
 		Data: map[string]string{
 			"users": "alice:hash",
 		},
@@ -229,10 +231,8 @@ func TestBasicAuthCanUseInjectedCredentialResolver(t *testing.T) {
 func TestBasicAuthFallsBackToSecretResolverWithInjectedCredentialResolver(t *testing.T) {
 	stop := test.NewStop(t)
 	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: "default",
-			Name:      "basic-auth",
-		},
+		Namespace: "default",
+		Name:      "basic-auth",
 		Data: map[string][]byte{
 			".htaccess": []byte("bob:hash"),
 		},
@@ -265,10 +265,8 @@ func TestBasicAuthFallsBackToSecretResolverWithInjectedCredentialResolver(t *tes
 func TestBasicAuthCustomResolverDoesNotImplicitlyFallbackToSecret(t *testing.T) {
 	stop := test.NewStop(t)
 	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: "default",
-			Name:      "basic-auth",
-		},
+		Namespace: "default",
+		Name:      "basic-auth",
 		Data: map[string][]byte{
 			".htaccess": []byte("bob:hash"),
 		},
@@ -292,10 +290,8 @@ func TestBasicAuthCustomResolverDoesNotImplicitlyFallbackToSecret(t *testing.T) 
 func TestBackendAuthCustomKeyRejectsEmptyValue(t *testing.T) {
 	stop := test.NewStop(t)
 	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: "default",
-			Name:      "backend-auth",
-		},
+		Namespace: "default",
+		Name:      "backend-auth",
 		Data: map[string][]byte{
 			"token": []byte("  "),
 		},
@@ -305,18 +301,14 @@ func TestBackendAuthCustomKeyRejectsEmptyValue(t *testing.T) {
 		Secrets: secrets,
 	}, kubeutils.NewSecretCredentialResolver(secrets))
 	policy := &agentgateway.AgentgatewayPolicy{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: "default",
-			Name:      "backend-auth",
-		},
+		Namespace: "default",
+		Name:      "backend-auth",
 		Spec: agentgateway.AgentgatewayPolicySpec{
 			Backend: &agentgateway.BackendFull{
-				BackendSimple: agentgateway.BackendSimple{
-					Auth: &agentgateway.BackendAuth{
-						SecretRef: &agentgateway.LocalSecretKeyRef{
-							Name: "backend-auth",
-							Key:  new("token"),
-						},
+				Auth: &agentgateway.BackendAuth{
+					SecretRef: &agentgateway.LocalSecretKeyRef{
+						Name: "backend-auth",
+						Key:  new("token"),
 					},
 				},
 			},

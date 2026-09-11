@@ -172,7 +172,8 @@ fn test_metadata_from_header() {
 		output_config: None,
 	};
 
-	let (out, _) = super::from_messages::translate_internal(req, &provider, Some(&headers)).unwrap();
+	let (out, _) =
+		super::from_messages::translate_internal(req, &provider, Some(&headers), None).unwrap();
 	let metadata = out.request_metadata.unwrap();
 
 	assert_eq!(metadata.get("user_id"), Some(&"user123".to_string()));
@@ -222,7 +223,7 @@ fn test_output_config_effort_without_thinking_is_passed_through() {
 		}),
 	};
 
-	let (out, _) = super::from_messages::translate_internal(req, &provider, None).unwrap();
+	let (out, _) = super::from_messages::translate_internal(req, &provider, None, None).unwrap();
 	assert_eq!(
 		out.additional_model_request_fields,
 		Some(json!({
@@ -275,7 +276,7 @@ fn test_explicit_empty_output_config_is_preserved() {
 		}),
 	};
 
-	let (out, _) = super::from_messages::translate_internal(req, &provider, None).unwrap();
+	let (out, _) = super::from_messages::translate_internal(req, &provider, None, None).unwrap();
 	assert_eq!(
 		out.additional_model_request_fields,
 		Some(json!({
@@ -332,7 +333,7 @@ fn test_thinking_and_output_config_are_both_passed_through() {
 		}),
 	};
 
-	let (out, _) = super::from_messages::translate_internal(req, &provider, None).unwrap();
+	let (out, _) = super::from_messages::translate_internal(req, &provider, None, None).unwrap();
 	assert_eq!(
 		out.additional_model_request_fields,
 		Some(json!({
@@ -398,7 +399,7 @@ fn test_adaptive_thinking_preserves_sampling_and_tool_choice() {
 		output_config: None,
 	};
 
-	let (out, _) = super::from_messages::translate_internal(req, &provider, None).unwrap();
+	let (out, _) = super::from_messages::translate_internal(req, &provider, None, None).unwrap();
 	let inference = out.inference_config.unwrap();
 	assert_eq!(inference.temperature, Some(0.7));
 	assert_eq!(inference.top_p, Some(0.8));
@@ -475,7 +476,7 @@ fn test_enabled_thinking_applies_sampling_and_tool_choice_constraints() {
 		output_config: None,
 	};
 
-	let (out, _) = super::from_messages::translate_internal(req, &provider, None).unwrap();
+	let (out, _) = super::from_messages::translate_internal(req, &provider, None, None).unwrap();
 	let inference = out.inference_config.unwrap();
 	assert_eq!(inference.temperature, None);
 	assert_eq!(inference.top_p, None);
@@ -524,7 +525,7 @@ fn test_messages_image_url_to_bedrock_returns_error() {
 		output_config: None,
 	};
 
-	let err = super::from_messages::translate_internal(req, &provider, None).unwrap_err();
+	let err = super::from_messages::translate_internal(req, &provider, None, None).unwrap_err();
 	assert!(matches!(err, crate::AIError::UnsupportedConversion(_)));
 	assert!(
 		err
@@ -560,7 +561,7 @@ fn test_completions_image_data_url_maps_to_converse_image_block() {
 	}))
 	.expect("valid completions request");
 
-	let translated = super::from_completions::translate(&req, &provider, None, None)
+	let translated = super::from_completions::translate(&req, &provider, None, None, None)
 		.unwrap()
 		.body;
 	let translated: serde_json::Value = serde_json::from_slice(&translated).unwrap();
@@ -596,7 +597,7 @@ fn test_completions_image_url_to_bedrock_returns_error() {
 	}))
 	.expect("valid completions request");
 
-	let err = super::from_completions::translate(&req, &provider, None, None).unwrap_err();
+	let err = super::from_completions::translate(&req, &provider, None, None, None).unwrap_err();
 	assert!(matches!(err, crate::AIError::UnsupportedConversion(_)));
 }
 
@@ -670,6 +671,7 @@ fn test_completions_request_metadata_only_uses_bedrock_header() {
 		"anthropic.claude-3-sonnet".to_string(),
 		&provider,
 		Some(&headers),
+		None,
 		None,
 	)
 	.unwrap();
@@ -762,6 +764,7 @@ fn test_completions_json_schema_response_format_maps_to_converse_output_config()
 		&provider,
 		None,
 		None,
+		None,
 	)
 	.unwrap();
 	assert_eq!(
@@ -842,6 +845,7 @@ fn test_completions_reasoning_effort_maps_to_enabled_thinking_budget() {
 		&provider,
 		None,
 		None,
+		None,
 	)
 	.unwrap();
 
@@ -920,6 +924,7 @@ fn test_completions_explicit_thinking_budget_forces_enabled_thinking() {
 		&provider,
 		None,
 		None,
+		None,
 	)
 	.unwrap();
 
@@ -962,7 +967,7 @@ fn test_responses_request_metadata_only_uses_bedrock_header() {
 			.unwrap(),
 	);
 
-	let translated = super::from_responses::translate(&req, &provider, Some(&headers), None)
+	let translated = super::from_responses::translate(&req, &provider, Some(&headers), None, None)
 		.unwrap()
 		.body;
 	let translated: serde_json::Value = serde_json::from_slice(&translated).unwrap();
@@ -997,7 +1002,7 @@ fn test_responses_reasoning_effort_maps_to_enabled_thinking_budget() {
 	}))
 	.expect("valid responses request");
 
-	let translated = super::from_responses::translate(&req, &provider, None, None)
+	let translated = super::from_responses::translate(&req, &provider, None, None, None)
 		.unwrap()
 		.body;
 	let translated: serde_json::Value = serde_json::from_slice(&translated).unwrap();
@@ -1035,7 +1040,7 @@ fn test_responses_explicit_thinking_budget_forces_enabled_thinking() {
 	}))
 	.expect("valid responses request");
 
-	let translated = super::from_responses::translate(&req, &provider, None, None)
+	let translated = super::from_responses::translate(&req, &provider, None, None, None)
 		.unwrap()
 		.body;
 	let translated: serde_json::Value = serde_json::from_slice(&translated).unwrap();
@@ -1070,7 +1075,7 @@ fn test_responses_vendor_extension_thinking_budget_forces_enabled_thinking() {
 	}))
 	.expect("valid responses request");
 
-	let translated = super::from_responses::translate(&req, &provider, None, None)
+	let translated = super::from_responses::translate(&req, &provider, None, None, None)
 		.unwrap()
 		.body;
 	let translated: serde_json::Value = serde_json::from_slice(&translated).unwrap();
@@ -1383,11 +1388,76 @@ fn test_embeddings_response_translation_cohere() {
 	let translated = from_embeddings::translate_response(&bytes, &headers, model).unwrap();
 	let openai_resp = translated
 		.serialize()
-		.and_then(|b| serde_json::from_slice::<types::embeddings::Response>(&b))
+		.and_then(|b| serde_json::from_slice::<types::embeddings::typed::Response>(&b))
 		.unwrap();
 
 	assert_eq!(openai_resp.object, "list");
-	assert_eq!(openai_resp.usage.unwrap().prompt_tokens, 10);
+	assert_eq!(
+		openai_resp.data[0].embedding,
+		vec![0.1_f32, 0.2_f32, 0.3_f32]
+	);
+	assert_eq!(
+		openai_resp.data[1].embedding,
+		vec![0.4_f32, 0.5_f32, 0.6_f32]
+	);
+	assert_eq!(openai_resp.usage.prompt_tokens, 10);
+}
+
+#[test]
+fn test_embeddings_response_translation_cohere_v4_uses_float_vectors() {
+	let model = "cohere.embed-v4:0";
+	let bedrock_resp = json!({
+		"embeddings": {
+			"float": [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]],
+			"int8": [[1, 2, 3], [4, 5, 6]]
+		},
+		"id": "123",
+		"texts": ["hello", "world"]
+	});
+	let bytes = serde_json::to_vec(&bedrock_resp).unwrap();
+	let headers = HeaderMap::new();
+
+	let translated = from_embeddings::translate_response(&bytes, &headers, model).unwrap();
+	let openai_resp = translated
+		.serialize()
+		.and_then(|b| serde_json::from_slice::<types::embeddings::typed::Response>(&b))
+		.unwrap();
+
+	assert_eq!(
+		openai_resp.data[0].embedding,
+		vec![0.1_f32, 0.2_f32, 0.3_f32]
+	);
+	assert_eq!(
+		openai_resp.data[1].embedding,
+		vec![0.4_f32, 0.5_f32, 0.6_f32]
+	);
+}
+
+#[test]
+fn test_embeddings_response_translation_cohere_v4_requires_float_vectors() {
+	let model = "cohere.embed-v4:0";
+	let bedrock_resp = json!({
+		"embeddings": {
+			"uint8": [[1, 2, 3]],
+			"int8": [[-1, 0, 1]]
+		},
+		"id": "123",
+		"texts": ["hello"]
+	});
+	let bytes = serde_json::to_vec(&bedrock_resp).unwrap();
+	let headers = HeaderMap::new();
+
+	let err = match from_embeddings::translate_response(&bytes, &headers, model) {
+		Ok(_) => panic!("expected a response without float embeddings to fail"),
+		Err(err) => err,
+	};
+
+	assert!(matches!(err, crate::AIError::ResponseParsing(_)));
+	assert!(
+		err
+			.to_string()
+			.contains("Cohere response did not include float embeddings; received types: int8, uint8")
+	);
 }
 
 #[test]
@@ -1595,7 +1665,8 @@ fn test_messages_long_tool_names_fit_bedrock_tool_config() {
 		output_config: None,
 	};
 
-	let (out, tool_map) = super::from_messages::translate_internal(req, &provider, None).unwrap();
+	let (out, tool_map) =
+		super::from_messages::translate_internal(req, &provider, None, None).unwrap();
 	let bedrock_name = out
 		.tool_config
 		.as_ref()
@@ -1652,7 +1723,7 @@ fn test_messages_long_tool_name_round_trip_response() {
 	};
 
 	let (bedrock_req, tool_map) =
-		super::from_messages::translate_internal(req, &provider, None).unwrap();
+		super::from_messages::translate_internal(req, &provider, None, None).unwrap();
 	let bedrock_name = bedrock_req
 		.tool_config
 		.as_ref()
@@ -1727,7 +1798,7 @@ fn test_responses_assistant_input_image_is_rejected() {
 	}))
 	.expect("valid responses request");
 
-	let err = super::from_responses::translate(&req, &provider, None, None).unwrap_err();
+	let err = super::from_responses::translate(&req, &provider, None, None, None).unwrap_err();
 	assert!(matches!(err, crate::AIError::UnsupportedConversion(_)));
 	assert!(
 		err
@@ -1759,7 +1830,7 @@ fn test_responses_input_image_remote_url_is_rejected() {
 	}))
 	.expect("valid responses request");
 
-	let err = super::from_responses::translate(&req, &provider, None, None).unwrap_err();
+	let err = super::from_responses::translate(&req, &provider, None, None, None).unwrap_err();
 	assert!(matches!(err, crate::AIError::UnsupportedConversion(_)));
 	assert!(
 		err
@@ -1791,7 +1862,7 @@ fn test_responses_input_image_non_base64_data_url_is_rejected() {
 	}))
 	.expect("valid responses request");
 
-	let err = super::from_responses::translate(&req, &provider, None, None).unwrap_err();
+	let err = super::from_responses::translate(&req, &provider, None, None, None).unwrap_err();
 	assert!(matches!(err, crate::AIError::UnsupportedConversion(_)));
 	assert!(
 		err
@@ -1823,7 +1894,7 @@ fn test_responses_input_image_non_image_data_url_is_rejected() {
 	}))
 	.expect("valid responses request");
 
-	let err = super::from_responses::translate(&req, &provider, None, None).unwrap_err();
+	let err = super::from_responses::translate(&req, &provider, None, None, None).unwrap_err();
 	assert!(matches!(err, crate::AIError::UnsupportedConversion(_)));
 	assert!(
 		err
@@ -1855,7 +1926,7 @@ fn test_responses_input_image_empty_media_type_data_url_is_rejected() {
 	}))
 	.expect("valid responses request");
 
-	let err = super::from_responses::translate(&req, &provider, None, None).unwrap_err();
+	let err = super::from_responses::translate(&req, &provider, None, None, None).unwrap_err();
 	assert!(matches!(err, crate::AIError::UnsupportedConversion(_)));
 	assert!(
 		err
@@ -1887,7 +1958,7 @@ fn test_responses_input_image_file_id_is_rejected() {
 	}))
 	.expect("valid responses request");
 
-	let err = super::from_responses::translate(&req, &provider, None, None).unwrap_err();
+	let err = super::from_responses::translate(&req, &provider, None, None, None).unwrap_err();
 	assert!(matches!(err, crate::AIError::UnsupportedConversion(_)));
 }
 
@@ -1914,7 +1985,7 @@ fn test_responses_system_input_file_is_rejected() {
 	}))
 	.expect("valid responses request");
 
-	let err = super::from_responses::translate(&req, &provider, None, None).unwrap_err();
+	let err = super::from_responses::translate(&req, &provider, None, None, None).unwrap_err();
 	assert!(matches!(err, crate::AIError::UnsupportedConversion(_)));
 	assert!(
 		err
@@ -1946,7 +2017,7 @@ fn test_responses_input_file_id_is_rejected() {
 	}))
 	.expect("valid responses request");
 
-	let err = super::from_responses::translate(&req, &provider, None, None).unwrap_err();
+	let err = super::from_responses::translate(&req, &provider, None, None, None).unwrap_err();
 	assert!(matches!(err, crate::AIError::UnsupportedConversion(_)));
 	assert!(
 		err.to_string().contains("file_id is unsupported"),
@@ -1977,7 +2048,7 @@ fn test_responses_input_file_remote_url_is_rejected() {
 	}))
 	.expect("valid responses request");
 
-	let err = super::from_responses::translate(&req, &provider, None, None).unwrap_err();
+	let err = super::from_responses::translate(&req, &provider, None, None, None).unwrap_err();
 	assert!(matches!(err, crate::AIError::UnsupportedConversion(_)));
 	assert!(
 		err.to_string().contains("remote URLs are unsupported"),
@@ -2008,7 +2079,7 @@ fn test_responses_input_file_unknown_format_is_rejected() {
 	}))
 	.expect("valid responses request");
 
-	let err = super::from_responses::translate(&req, &provider, None, None).unwrap_err();
+	let err = super::from_responses::translate(&req, &provider, None, None, None).unwrap_err();
 	assert!(matches!(err, crate::AIError::UnsupportedConversion(_)));
 	assert!(
 		err

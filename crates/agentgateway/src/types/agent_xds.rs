@@ -35,7 +35,9 @@ use crate::telemetry::log::OrderedStringMap;
 use crate::types::discovery::NamespacedHostname;
 use crate::types::proto::ProtoError;
 use crate::types::proto::agent::backend_policy_spec::ai::request_guard::Kind;
-use crate::types::proto::agent::backend_policy_spec::ai::{ActionKind, response_guard};
+use crate::types::proto::agent::backend_policy_spec::ai::{
+	ActionKind, RejectAuditAction, response_guard,
+};
 use crate::types::proto::agent::backend_policy_spec::backend_http::HttpVersion;
 use crate::types::proto::agent::frontend_policy_spec::http::HttpHeaderCase;
 use crate::types::proto::agent::mcp_target::Protocol;
@@ -224,7 +226,7 @@ fn provider_connection_from_url(
 		host_override: Some(Target::from((host, port))),
 		path_prefix: {
 			let path = url.path().trim_end_matches('/');
-			(!path.is_empty()).then(|| strng::new(path))
+			Some(strng::new(if path.is_empty() { "/" } else { path }))
 		},
 		use_tls: url.scheme() == "https",
 	})
@@ -433,6 +435,17 @@ fn server_tls_config_from_proto(
 		return ServerTLSConfig::istio_workload(require_client_cert, default_alpns);
 	}
 
+	if certificate_source == proto::agent::tls_config::CertificateSource::Spiffe {
+		// SPIFFE always requires client SVIDs (mutual TLS); mtls_mode does not apply.
+		if mtls_mode != proto::agent::tls_config::MtlsMode::Strict {
+			diagnostics.add_warning(
+				"mtls_mode is ignored for SPIFFE certificates; client SVIDs are always required"
+					.to_string(),
+			);
+		}
+		return ServerTLSConfig::spiffe(default_alpns);
+	}
+
 	if certificate_source == proto::agent::tls_config::CertificateSource::DynamicCa {
 		if value.root.is_some() {
 			diagnostics.add_warning("mTLS is not supported with DYNAMIC_CA certificates");
@@ -577,6 +590,7 @@ fn mcp_authentication_from_proto(
 		jwt_provider.into_iter().collect(),
 		mode.into(),
 		http::auth::AuthorizationLocation::bearer_header(),
+		false,
 	);
 	Ok(build_mcp_authentication(
 		m.issuer.clone(),
@@ -688,6 +702,8 @@ fn convert_route_type(proto_rt: i32, diagnostics: &mut Diagnostics) -> llm::Rout
 		Ok(ProtoRT::Embeddings) => llm::RouteType::Embeddings,
 		Ok(ProtoRT::Realtime) => llm::RouteType::Realtime,
 		Ok(ProtoRT::Rerank) => llm::RouteType::Rerank,
+		Ok(ProtoRT::GenerateContent) => llm::RouteType::GenerateContent,
+		Ok(ProtoRT::GeminiCountTokens) => llm::RouteType::GeminiCountTokens,
 		Err(_) => {
 			diagnostics.add_warning(format!(
 				"unknown proto RouteType value {}, defaulting to Completions",
@@ -851,6 +867,26 @@ fn convert_provider_format_config(
 	})
 }
 
+fn convert_content_scopes(scopes: &[i32]) -> Result<Vec<llm::ContentScope>, ProtoError> {
+	use proto::agent::backend_policy_spec::ai::ContentScope as ProtoScope;
+
+	if scopes.is_empty() {
+		return Ok(llm::policy::default_content_scope());
+	}
+	scopes
+		.iter()
+		.map(|s| match ProtoScope::try_from(*s) {
+			Ok(ProtoScope::SystemPrompt) => Ok(llm::ContentScope::SystemPrompt),
+			Ok(ProtoScope::Messages) => Ok(llm::ContentScope::Messages),
+			Ok(ProtoScope::ToolOutput) => Ok(llm::ContentScope::ToolOutput),
+			Ok(ProtoScope::ToolInput) => Ok(llm::ContentScope::ToolInput),
+			Ok(ProtoScope::Unspecified) | Err(_) => Err(ProtoError::Generic(format!(
+				"unknown prompt guard content scope value {s}"
+			))),
+		})
+		.collect()
+}
+
 fn convert_backend_ai_policy(
 	ai: &proto::agent::backend_policy_spec::Ai,
 	diagnostics: &mut Diagnostics,
@@ -894,6 +930,7 @@ fn convert_backend_ai_policy(
 							.collect::<Result<Vec<_>, _>>()?;
 						let md = llm::policy::Moderation {
 							model: m.model.as_deref().map(strng::new),
+							action: convert_reject_audit(m.action),
 							policies: pols,
 						};
 						llm::policy::RequestGuardKind::OpenAIModeration(md)
@@ -908,6 +945,7 @@ fn convert_backend_ai_policy(
 							template_id: strng::new(&gma.template_id),
 							project_id: strng::new(&gma.project_id),
 							location: gma.location.as_ref().map(strng::new),
+							action: convert_reject_audit(gma.action),
 							policies: pols,
 						})
 					},
@@ -921,6 +959,7 @@ fn convert_backend_ai_policy(
 							guardrail_identifier: strng::new(&bg.identifier),
 							guardrail_version: strng::new(&bg.version),
 							region: strng::new(&bg.region),
+							action: convert_reject_audit(bg.action),
 							policies: pols,
 						})
 					},
@@ -932,6 +971,7 @@ fn convert_backend_ai_policy(
 							.collect::<Result<Vec<_>, _>>()?;
 						llm::policy::RequestGuardKind::AzureContentSafety(llm::policy::AzureContentSafety {
 							endpoint: strng::new(&acs.endpoint),
+							action: convert_reject_audit(acs.action),
 							policies: pols,
 							cached_azure_auth: Default::default(),
 							analyze_text: Some(llm::policy::AnalyzeTextConfig {
@@ -948,7 +988,17 @@ fn convert_backend_ai_policy(
 						})
 					},
 				};
-				Ok(llm::policy::RequestGuard { rejection, kind })
+				let guard = llm::policy::RequestGuard {
+					rejection,
+					scope: convert_content_scopes(&reqp.scope)?,
+					kind,
+				};
+
+				// TODO not all guard types properly scan all scopes
+				// avoids silently ignoring configured scopes
+				guard.validate_scope().map_err(ProtoError::Generic)?;
+
+				Ok(guard)
 			})
 			.collect::<Result<Vec<_>, ProtoError>>()?;
 
@@ -985,6 +1035,7 @@ fn convert_backend_ai_policy(
 						template_id: strng::new(&gma.template_id),
 						project_id: strng::new(&gma.project_id),
 						location: gma.location.as_ref().map(strng::new),
+						action: convert_reject_audit(gma.action),
 						policies: pols,
 					})
 				},
@@ -998,6 +1049,7 @@ fn convert_backend_ai_policy(
 						guardrail_identifier: strng::new(&bg.identifier),
 						guardrail_version: strng::new(&bg.version),
 						region: strng::new(&bg.region),
+						action: convert_reject_audit(bg.action),
 						policies: pols,
 					})
 				},
@@ -1009,6 +1061,7 @@ fn convert_backend_ai_policy(
 						.collect::<Vec<_>>();
 					llm::policy::ResponseGuardKind::AzureContentSafety(llm::policy::AzureContentSafety {
 						endpoint: strng::new(&acs.endpoint),
+						action: convert_reject_audit(acs.action),
 						policies: pols,
 						cached_azure_auth: Default::default(),
 						analyze_text: Some(llm::policy::AnalyzeTextConfig {
@@ -1308,7 +1361,7 @@ fn backend_auth_kind_from_proto(
 			BackendAuthKind::Aws(aws_auth)
 		},
 		Some(proto::agent::backend_auth_policy::Kind::Azure(a)) => {
-			let azure_auth = match a.kind {
+			let kind = match a.kind {
 				Some(proto::agent::azure::Kind::ExplicitConfig(config)) => {
 					let src = match config.credential_source {
 						Some(azure_explicit_config::CredentialSource::ClientSecret(cs)) => {
@@ -1342,22 +1395,25 @@ fn backend_auth_kind_from_proto(
 							return Err(ProtoError::MissingRequiredField);
 						},
 					};
-					auth::azure::AzureAuth::ExplicitConfig {
+					auth::azure::AzureAuthKind::ExplicitConfig {
 						credential_source: src,
 						cached_cred: Default::default(),
 					}
 				},
 				Some(proto::agent::azure::Kind::DeveloperImplicit(_)) => {
-					auth::azure::AzureAuth::DeveloperImplicit {
+					auth::azure::AzureAuthKind::DeveloperImplicit {
 						cached_cred: Default::default(),
 					}
 				},
-				Some(proto::agent::azure::Kind::Implicit(_)) => auth::azure::AzureAuth::Implicit {
+				Some(proto::agent::azure::Kind::Implicit(_)) => auth::azure::AzureAuthKind::Implicit {
 					cached_cred: Default::default(),
 				},
 				None => return Err(ProtoError::MissingRequiredField),
 			};
-			BackendAuthKind::Azure(azure_auth)
+			BackendAuthKind::Azure(auth::azure::AzureAuth {
+				kind,
+				scopes: a.scopes,
+			})
 		},
 		Some(proto::agent::backend_auth_policy::Kind::OauthTokenExchange(s)) => {
 			BackendAuthKind::OAuthTokenExchange(Box::new(
@@ -1439,7 +1495,6 @@ impl Bind {
 		Ok(Self {
 			key: s.key.clone().into(),
 			address,
-			listeners: Default::default(),
 			protocol: match proto::agent::bind::Protocol::try_from(s.protocol)? {
 				proto::agent::bind::Protocol::Http => BindProtocol::http,
 				proto::agent::bind::Protocol::Tcp => BindProtocol::tcp,
@@ -1516,7 +1571,7 @@ impl TCPRoute {
 				.iter()
 				.map(|b| TCPRouteBackendReference {
 					weight: b.weight as usize,
-					backend: resolve_simple_reference(b.backend.as_ref()),
+					backend: resolve_reference(b.backend.as_ref()),
 					inline_policies: Vec::new(),
 				})
 				.collect::<Vec<_>>(),
@@ -1591,7 +1646,14 @@ impl ModelRoute {
 		let llm_policy = s
 			.ai_policy
 			.as_ref()
-			.map(|policy| convert_backend_ai_policy(policy, diagnostics).map(Arc::new))
+			.map(|policy| {
+				let mut policy = convert_backend_ai_policy(policy, diagnostics)?;
+				// Preserve default model endpoint formats when the policy does not specify routes.
+				if policy.routes.is_empty() {
+					policy.routes = llm::model_router::default_route_types().routes.clone();
+				}
+				Ok::<_, ProtoError>(Arc::new(policy))
+			})
 			.transpose()?
 			.unwrap_or_else(llm::model_router::default_route_types);
 		let authorization = s
@@ -1646,6 +1708,7 @@ impl ModelRoute {
 								.map(|target| llm::model_router::WeightedTarget {
 									model: target.model.clone(),
 									weight: target.weight as usize,
+									invalid: target.invalid,
 								})
 								.collect(),
 						)
@@ -1673,6 +1736,7 @@ impl ModelRoute {
 										expr.clone(),
 									)
 								}),
+								invalid: target.invalid,
 							});
 						}
 						llm::model_router::VirtualModelRouting::Conditional(targets)
@@ -1710,6 +1774,7 @@ impl ModelRoute {
 			ModelRoute {
 				key: strng::new(&s.key),
 				name,
+				router_key: strng::new(&s.router_key),
 				kind,
 			},
 			strng::new(&s.listener_key),
@@ -2001,11 +2066,19 @@ pub(crate) fn backend_with_policies_from_proto(
 					proto::agent::mcp_backend::FailureMode::FailClosed => FailureMode::FailClosed,
 				},
 				session_idle_ttl: crate::mcp::DEFAULT_SESSION_IDLE_TTL,
+				sse_keep_alive: m.sse_keep_alive.map(convert_duration),
+				dns_rebinding_protection: false,
 			},
 		),
 		Some(backend::Kind::Guardrail(_)) => {
 			diagnostics.add_warning("guardrail backends are not yet implemented and will be ignored");
 			Backend::Invalid
+		},
+		Some(backend::Kind::ModelRouter(_)) => {
+			return Err(ProtoError::Generic(
+				"model router backend must be dispatched through Store::insert_xds_model_router"
+					.to_string(),
+			));
 		},
 		None => {
 			return Err(ProtoError::Generic("unknown backend".to_string()));
@@ -2223,6 +2296,15 @@ fn backend_policy_from_proto(
 				failure_mode,
 			})
 		},
+		Some(bps::Kind::SessionAffinity(sa)) => {
+			BackendTrafficPolicy::SessionAffinity(http::sessionaffinity::Policy {
+				source: permissive_cel_expression_arc(
+					diagnostics,
+					"backend.sessionAffinity.source",
+					&sa.source,
+				),
+			})
+		},
 		Some(bps::Kind::BackendHttp(bhttp)) => {
 			let ver = bps::backend_http::HttpVersion::try_from(bhttp.version)?;
 			BackendTrafficPolicy::HTTP(backend::HTTP {
@@ -2232,21 +2314,22 @@ fn backend_policy_from_proto(
 					HttpVersion::Http2 => Some(::http::Version::HTTP_2),
 				},
 				request_timeout: bhttp.request_timeout.map(convert_duration),
+				max_connection_duration: bhttp.max_connection_duration.map(convert_duration),
 			})
 		},
 		Some(bps::Kind::BackendTcp(btcp)) => BackendTrafficPolicy::TCP(backend::TCP {
-			connect_timeout: btcp
-				.connect_timeout
-				.map(convert_duration)
-				.unwrap_or(backend::defaults::connect_timeout()),
+			connect_timeout: btcp.connect_timeout.map(convert_duration),
 			keepalives: btcp
 				.keepalive
 				.as_ref()
-				.map(types::agent::KeepaliveConfig::from)
-				.unwrap_or_default(),
+				.map(types::agent::KeepaliveConfig::from),
 		}),
 		Some(bps::Kind::BackendTunnel(bt)) => BackendTrafficPolicy::Tunnel(backend::Tunnel {
 			proxy: Arc::new(resolve_simple_reference(bt.proxy.as_ref())),
+			mode: match bt.mode() {
+				bps::backend_tunnel::Mode::Connect => backend::TunnelMode::Connect,
+				bps::backend_tunnel::Mode::Auto => backend::TunnelMode::Auto,
+			},
 			policies: backend_policies_from_proto(&bt.inline_policies, diagnostics)?,
 		}),
 		Some(bps::Kind::BackendTls(btls)) => {
@@ -2268,6 +2351,9 @@ fn backend_policy_from_proto(
 					&btls.key_exchange_groups,
 					diagnostics,
 				),
+				spiffe: bps::backend_tls::CertificateSource::try_from(btls.certificate_source)
+					.unwrap_or_default()
+					== bps::backend_tls::CertificateSource::Spiffe,
 			}
 			.try_into()
 			.map_err(|e| ProtoError::Generic(e.to_string()))?;
@@ -2428,6 +2514,11 @@ fn traffic_policy_from_proto(
 				.as_ref()
 				.map(|d| (*d).try_into())
 				.transpose()?,
+			response_idle_timeout: t
+				.response_idle
+				.as_ref()
+				.map(|d| (*d).try_into())
+				.transpose()?,
 		}),
 		Some(tps::Kind::Retry(r)) => {
 			let attempts = std::num::NonZeroU8::new(r.attempts as u8)
@@ -2571,6 +2662,7 @@ fn traffic_policy_from_proto(
 					jwt.authorization_location.as_ref(),
 					http::auth::AuthorizationLocation::bearer_header(),
 				)?,
+				jwt.preserve_token,
 			);
 			let mcp = match &jwt.mcp {
 				Some(mcp) => {
@@ -2941,7 +3033,14 @@ fn traffic_policy_from_proto(
 							));
 						},
 					};
-					Ok::<_, ProtoError>((key, meta))
+					Ok::<_, ProtoError>((
+						key,
+						http::apikey::APIKeyPolicy {
+							metadata: meta,
+							allowed_models: Default::default(),
+							budgets: None,
+						},
+					))
 				})
 				.collect::<Result<Vec<_>, _>>()?;
 			TrafficPolicy::APIKey(RequestPolicy::single(http::apikey::APIKeyAuthentication {
@@ -3149,7 +3248,12 @@ fn external_auth_from_proto(
 }
 
 fn convert_duration(d: prost_types::Duration) -> Duration {
-	Duration::from_secs(d.seconds as u64) + Duration::from_nanos(d.nanos as u64)
+	// Proto duration fields are signed,
+	// but the standard duration type only represents positive spans of time.
+	// Clamp negative components at zero to avoid unexpected behaviors.
+	let secs = d.seconds.max(0) as u64;
+	let nanos = d.nanos.max(0) as u32;
+	Duration::new(secs, nanos)
 }
 
 fn convert_jwt_sign_ttl(ttl: Option<prost_types::Duration>) -> Result<Option<Duration>, String> {
@@ -3248,10 +3352,7 @@ fn frontend_policy_from_proto(
 
 	Ok(match &spec.kind {
 		Some(fps::Kind::Http(h)) => FrontendPolicy::HTTP(frontend::HTTP {
-			max_buffer_size: h
-				.max_buffer_size
-				.map(|v| v as usize)
-				.unwrap_or_else(crate::defaults::max_buffer_size),
+			max_buffer_size: h.max_buffer_size.map(|v| v as usize),
 			http1_max_headers: h.http1_max_headers.map(|v| v as usize),
 			http1_idle_timeout: h
 				.http1_idle_timeout
@@ -3270,6 +3371,9 @@ fn frontend_policy_from_proto(
 			http2_keepalive_interval: h.http2_keepalive_interval.map(convert_duration),
 			http2_keepalive_timeout: h.http2_keepalive_timeout.map(convert_duration),
 			max_connection_duration: h.max_connection_duration.map(convert_duration),
+			max_concurrent_requests: h
+				.max_concurrent_requests
+				.and_then(std::num::NonZeroU32::new),
 		}),
 		Some(fps::Kind::Tls(t)) => FrontendPolicy::TLS(frontend::TLS {
 			handshake_timeout: t
@@ -3289,8 +3393,8 @@ fn frontend_policy_from_proto(
 			keepalives: t
 				.keepalives
 				.as_ref()
-				.map(types::agent::KeepaliveConfig::from)
-				.unwrap_or_default(),
+				.map(types::agent::KeepaliveConfig::from),
+			max_connections: t.max_connections.and_then(std::num::NonZeroU32::new),
 		}),
 		Some(fps::Kind::NetworkAuthorization(rbac)) => {
 			let mut allow_exprs = Vec::new();
@@ -3437,7 +3541,12 @@ fn frontend_policy_from_proto(
 					})
 				})
 				.transpose()?;
+			let preset = match fps::logging::Preset::try_from(p.preset) {
+				Ok(fps::logging::Preset::Otel) => Some(frontend::AccessLogPreset::Otel),
+				Ok(fps::logging::Preset::Unspecified) | Err(_) => None,
+			};
 			let mut logging_policy = frontend::LoggingPolicy {
+				preset,
 				filter: p
 					.filter
 					.as_ref()
@@ -3539,6 +3648,10 @@ fn tracing_config_from_proto(
 		.client_sampling
 		.as_ref()
 		.map(|s| permissive_cel_expression_arc(diagnostics, "frontend.tracing.clientSampling", s));
+	let parent_not_sampled = t
+		.parent_not_sampled
+		.as_ref()
+		.map(|s| permissive_cel_expression_arc(diagnostics, "frontend.tracing.parentNotSampled", s));
 	let filter = t
 		.filter
 		.as_ref()
@@ -3565,6 +3678,7 @@ fn tracing_config_from_proto(
 		remove: t.remove.clone(),
 		random_sampling,
 		client_sampling,
+		parent_not_sampled,
 		filter,
 		path,
 		protocol,
@@ -3678,6 +3792,7 @@ pub(crate) fn targeted_policy_from_proto(
 		key: strng::new(&p.key),
 		name: p.name.as_ref().map(Into::into),
 		target,
+		creation_timestamp: p.creation_timestamp,
 		inheritance: policy_inheritance_from_proto(p.inheritance),
 		policy,
 	})
@@ -3805,11 +3920,14 @@ fn traffic_policy_kind_name(policy: &TrafficPolicy) -> &'static str {
 		TrafficPolicy::LocalRateLimit(_) => "localRateLimit",
 		TrafficPolicy::RemoteRateLimit(_) => "remoteRateLimit",
 		TrafficPolicy::ExtAuthz(_) => "extAuthz",
+		TrafficPolicy::SubstrateEgress(_) => "substrateEgress",
+		TrafficPolicy::SubstrateIngress(_) => "substrateIngress",
 		TrafficPolicy::ExtProc(_) => "extProc",
 		TrafficPolicy::JwtAuth(_) => "jwt",
 		TrafficPolicy::Oidc(_) => "oidc",
 		TrafficPolicy::BasicAuth(_) => "basicAuth",
 		TrafficPolicy::APIKey(_) => "apiKey",
+		TrafficPolicy::Budget(_) => "budget",
 		TrafficPolicy::Transformation(_) => "transformation",
 		TrafficPolicy::Csrf(_) => "csrf",
 		TrafficPolicy::RequestHeaderModifier(_) => "requestHeaderModifier",
@@ -3928,6 +4046,14 @@ fn convert_prompt_caching(
 	}
 }
 
+fn convert_reject_audit(action: i32) -> llm::policy::RejectAuditAction {
+	if action == RejectAuditAction::Audit as i32 {
+		llm::policy::RejectAuditAction::Audit
+	} else {
+		llm::policy::RejectAuditAction::Reject
+	}
+}
+
 fn convert_webhook(
 	w: &proto::agent::backend_policy_spec::ai::Webhook,
 	diagnostics: &mut Diagnostics,
@@ -3973,6 +4099,7 @@ fn convert_webhook(
 		headers,
 		forward_header_matches,
 		failure_mode,
+		action: convert_reject_audit(w.action),
 	})
 }
 
@@ -3986,6 +4113,7 @@ fn convert_regex_rules(
 			llm::policy::Action::Mask
 		},
 		Some(ActionKind::Reject) => llm::policy::Action::Reject,
+		Some(ActionKind::Audit) => llm::policy::Action::Audit,
 	};
 	let rules = rr
 		.rules
@@ -4102,6 +4230,48 @@ mod tests {
 	use super::*;
 	use crate::store::RequestPolicyTrait;
 	use crate::types::proto::agent::backend_policy_spec::Ai;
+
+	#[test]
+	fn prompt_guard_scope_from_proto() {
+		use proto::agent::backend_policy_spec::ai::ContentScope as ProtoScope;
+
+		// unset scope keeps today's default so existing configs are unaffected
+		assert_eq!(
+			convert_content_scopes(&[]).unwrap(),
+			llm::policy::default_content_scope()
+		);
+		// opting in to tool scanning
+		assert_eq!(
+			convert_content_scopes(&[
+				ProtoScope::Messages as i32,
+				ProtoScope::ToolOutput as i32,
+				ProtoScope::ToolInput as i32,
+			])
+			.unwrap(),
+			vec![
+				llm::ContentScope::Messages,
+				llm::ContentScope::ToolOutput,
+				llm::ContentScope::ToolInput,
+			]
+		);
+		convert_content_scopes(&[ProtoScope::Unspecified as i32]).unwrap_err();
+		convert_content_scopes(&[42]).unwrap_err();
+
+		// TODO respect scopes in all guard types
+		let ai = Ai {
+			prompt_guard: Some(proto::agent::backend_policy_spec::ai::PromptGuard {
+				request: vec![proto::agent::backend_policy_spec::ai::RequestGuard {
+					rejection: None,
+					kind: Some(Kind::OpenaiModeration(Default::default())),
+					scope: vec![ProtoScope::ToolInput as i32],
+				}],
+				..Default::default()
+			}),
+			..Default::default()
+		};
+		let err = convert_backend_ai_policy(&ai, &mut Diagnostics::default()).unwrap_err();
+		assert!(err.to_string().contains("non-default scope"), "{err}");
+	}
 
 	#[test]
 	fn inline_backend_reference_validates_target() {
@@ -4229,6 +4399,7 @@ mod tests {
 			key: "policy".to_string(),
 			name: None,
 			target: Some(test_policy_target()),
+			creation_timestamp: 123,
 			inheritance: proto::agent::policy::Inheritance::Default as i32,
 			kind: Some(proto::agent::policy::Kind::Conditional(
 				proto::agent::ConditionalPolicies {
@@ -4251,6 +4422,7 @@ mod tests {
 		};
 
 		let policy = targeted_policy_from_proto(&policy, &mut Diagnostics::default())?;
+		assert_eq!(policy.creation_timestamp, 123);
 		let PolicyType::Traffic(PhasedTrafficPolicy {
 			policy: TrafficPolicy::RequestHeaderModifier(policies),
 			..
@@ -4276,6 +4448,7 @@ mod tests {
 					},
 				)),
 			}),
+			creation_timestamp: 0,
 			inheritance: proto::agent::policy::Inheritance::Default as i32,
 			kind: Some(proto::agent::policy::Kind::Backend(
 				proto::agent::BackendPolicySpec {
@@ -4302,6 +4475,7 @@ mod tests {
 			key: "policy".to_string(),
 			name: None,
 			target: Some(test_policy_target()),
+			creation_timestamp: 0,
 			inheritance: proto::agent::policy::Inheritance::Default as i32,
 			kind: Some(proto::agent::policy::Kind::Conditional(
 				proto::agent::ConditionalPolicies {
@@ -4344,6 +4518,7 @@ mod tests {
 			key: "policy".to_string(),
 			name: None,
 			target: Some(test_policy_target()),
+			creation_timestamp: 0,
 			inheritance: proto::agent::policy::Inheritance::Default as i32,
 			kind: Some(proto::agent::policy::Kind::Conditional(
 				proto::agent::ConditionalPolicies {
@@ -4417,6 +4592,7 @@ mod tests {
 			key: "policy".to_string(),
 			name: None,
 			target: Some(test_policy_target()),
+			creation_timestamp: 0,
 			inheritance: proto::agent::policy::Inheritance::Default as i32,
 			kind: Some(proto::agent::policy::Kind::Conditional(
 				proto::agent::ConditionalPolicies {
@@ -4447,6 +4623,7 @@ mod tests {
 			key: "policy".to_string(),
 			name: None,
 			target: Some(test_policy_target()),
+			creation_timestamp: 0,
 			inheritance: proto::agent::policy::Inheritance::Default as i32,
 			kind: Some(proto::agent::policy::Kind::Conditional(
 				proto::agent::ConditionalPolicies {
@@ -4534,6 +4711,68 @@ mod tests {
 			jwt.validate_claims(&build_unsigned_token("kid")),
 			Err(TokenError::UnknownKeyId(kid)) if kid == "kid"
 		));
+		Ok(())
+	}
+
+	#[tokio::test]
+	async fn mcp_empty_jwks_loads_and_rejects_authentication() -> Result<(), ProtoError> {
+		use proto::agent::traffic_policy_spec as tps;
+
+		use crate::http::jwt::TokenError;
+
+		let spec = proto::agent::TrafficPolicySpec {
+			kind: Some(tps::Kind::Jwt(tps::Jwt {
+				mode: tps::jwt::Mode::Strict as i32,
+				providers: vec![tps::JwtProvider {
+					issuer: "https://issuer.example.com".into(),
+					jwks_source: Some(tps::jwt_provider::JwksSource::Inline(
+						r#"{"keys":[]}"#.into(),
+					)),
+					..Default::default()
+				}],
+				mcp: Some(Default::default()),
+				..Default::default()
+			})),
+			..Default::default()
+		};
+		let mut diagnostics = Diagnostics::default();
+		let TrafficPolicy::JwtAuth(policy) = traffic_policy_from_proto(&spec, &mut diagnostics)? else {
+			panic!("expected JWT auth policy");
+		};
+		let jwt = &policy.iter().next().expect("expected JWT policy").pol;
+		let mcp = jwt.mcp.as_ref().expect("expected MCP extension");
+		let legacy = mcp_authentication_from_proto(
+			&proto::agent::backend_policy_spec::McpAuthentication {
+				issuer: "https://issuer.example.com".into(),
+				jwks_inline: r#"{"keys":[]}"#.into(),
+				mode: proto::agent::backend_policy_spec::mcp_authentication::Mode::Strict as i32,
+				..Default::default()
+			},
+			&mut diagnostics,
+		)?;
+		assert!(diagnostics.into_warnings().is_empty());
+
+		for validator in [
+			&jwt.jwt,
+			mcp.jwt_validator.as_ref(),
+			legacy.jwt_validator.as_ref(),
+		] {
+			let mut request = ::http::Request::new(crate::http::Body::empty());
+			assert!(matches!(
+				validator.apply(None, &mut request).await,
+				Err(TokenError::Missing)
+			));
+			request.headers_mut().insert(
+				::http::header::AUTHORIZATION,
+				format!("Bearer {}", build_unsigned_token("kid"))
+					.parse()
+					.unwrap(),
+			);
+			assert!(matches!(
+				validator.apply(None, &mut request).await,
+				Err(TokenError::UnknownKeyId(kid)) if kid == "kid"
+			));
+		}
 		Ok(())
 	}
 
@@ -4731,6 +4970,14 @@ mod tests {
 					),
 					("/v1/messages".to_string(), RouteType::Messages as i32),
 					("/v1/detect".to_string(), RouteType::Detect as i32),
+					(
+						"/v1beta/models".to_string(),
+						RouteType::GenerateContent as i32,
+					),
+					(
+						"/v1beta/models:countTokens".to_string(),
+						RouteType::GeminiCountTokens as i32,
+					),
 				]
 				.into_iter()
 				.collect(),
@@ -4784,7 +5031,7 @@ mod tests {
 			assert!(post_transformation_policy.get("max_tokens").is_some());
 
 			// Verify routes conversion
-			assert_eq!(ai_policy.routes.len(), 3);
+			assert_eq!(ai_policy.routes.len(), 5);
 			assert_eq!(
 				ai_policy.routes.get("/v1/chat/completions"),
 				Some(&llm::RouteType::Completions)
@@ -4796,6 +5043,14 @@ mod tests {
 			assert_eq!(
 				ai_policy.routes.get("/v1/detect"),
 				Some(&llm::RouteType::Detect)
+			);
+			assert_eq!(
+				ai_policy.routes.get("/v1beta/models"),
+				Some(&llm::RouteType::GenerateContent)
+			);
+			assert_eq!(
+				ai_policy.routes.get("/v1beta/models:countTokens"),
+				Some(&llm::RouteType::GeminiCountTokens)
 			);
 		} else {
 			panic!("Expected AI policy variant");
@@ -4947,6 +5202,28 @@ mod tests {
 		);
 	}
 
+	#[test]
+	fn convert_duration_negative_seconds_and_nanos_becomes_zero() {
+		assert_eq!(
+			convert_duration(prost_types::Duration {
+				seconds: -1,
+				nanos: -500_000_000,
+			}),
+			Duration::ZERO
+		);
+	}
+
+	#[test]
+	fn convert_duration_mixed_sign_clamps_negative_component() {
+		assert_eq!(
+			convert_duration(prost_types::Duration {
+				seconds: -1,
+				nanos: 500_000_000,
+			}),
+			Duration::from_millis(500)
+		);
+	}
+
 	#[rstest::rstest]
 	#[case::negative(-1, 0)]
 	#[case::invalid_nanos(1, 1_000_000_000)]
@@ -5000,6 +5277,29 @@ mod tests {
 	}
 
 	#[test]
+	fn test_backend_auth_azure_scope_conversion() -> Result<(), ProtoError> {
+		let auth = backend_auth_kind_from_proto(
+			proto::agent::BackendAuthPolicy {
+				kind: Some(proto::agent::backend_auth_policy::Kind::Azure(
+					proto::agent::Azure {
+						kind: Some(proto::agent::azure::Kind::Implicit(
+							proto::agent::AzureImplicit {},
+						)),
+						scopes: vec!["https://graph.microsoft.com/.default".to_string()],
+					},
+				)),
+				credentials: vec![],
+			},
+			&mut Diagnostics::default(),
+		)?;
+		let Some(BackendAuthKind::Azure(auth::azure::AzureAuth { scopes, .. })) = auth else {
+			panic!("Expected Azure auth, got {auth:?}");
+		};
+		assert_eq!(scopes, ["https://graph.microsoft.com/.default"]);
+		Ok(())
+	}
+
+	#[test]
 	fn test_concrete_model_route_from_xds() -> Result<(), ProtoError> {
 		use proto::agent::backend_reference;
 		use proto::agent::model_route::concrete_model::ModelVisibility;
@@ -5008,6 +5308,7 @@ mod tests {
 		let proto_route = proto::agent::ModelRoute {
 			key: "default/gpt-5-mini".to_string(),
 			listener_key: "default/gw.http".to_string(),
+			router_key: String::new(),
 			created: 1_704_067_200,
 			r#match: Some(proto::agent::model_route::Match {
 				model: "gpt-5-mini".to_string(),
@@ -5022,7 +5323,10 @@ mod tests {
 				}),
 				backend_policies: vec![],
 			})),
-			ai_policy: None,
+			ai_policy: Some(proto::agent::backend_policy_spec::Ai {
+				transformations: [("model".to_string(), "\"gpt-5-mini\"".to_string())].into(),
+				..Default::default()
+			}),
 			authorization: Some(proto::agent::traffic_policy_spec::Rbac {
 				allow: vec!["request.headers['x-model-access'] == 'allowed'".to_string()],
 				deny: vec![],
@@ -5051,6 +5355,11 @@ mod tests {
 				.contains_key("/v1/chat/completions")
 		);
 		assert!(model.policies.authorization.is_some());
+		assert!(model.policies.llm.transformations.is_some());
+		assert_eq!(
+			model.policies.llm.resolve_route("/v1/messages"),
+			llm::RouteType::Messages
+		);
 		assert_eq!(model.backend.weight, 1);
 		match model.backend.target {
 			RouteBackendTarget::Backend(key) => {
@@ -5068,6 +5377,7 @@ mod tests {
 		let proto_route = proto::agent::ModelRoute {
 			key: "default/gpt-5-mini".to_string(),
 			listener_key: "default/gw.http".to_string(),
+			router_key: String::new(),
 			created: 0,
 			r#match: None,
 			kind: Some(Kind::ConcreteModel(ConcreteModel::default())),
@@ -5091,6 +5401,7 @@ mod tests {
 		let proto_route = proto::agent::ModelRoute {
 			key: "default/fast".to_string(),
 			listener_key: "default/gw.http".to_string(),
+			router_key: String::new(),
 			created: 1_704_153_600,
 			r#match: Some(proto::agent::model_route::Match {
 				model: "fast".to_string(),
@@ -5101,10 +5412,12 @@ mod tests {
 						weighted::Target {
 							model: "openai/gpt-5-mini".to_string(),
 							weight: 40,
+							invalid: true,
 						},
 						weighted::Target {
 							model: "anthropic/claude-haiku-4-5".to_string(),
 							weight: 60,
+							invalid: false,
 						},
 					],
 				})),
@@ -5127,8 +5440,10 @@ mod tests {
 		assert_eq!(targets.len(), 2);
 		assert_eq!(targets[0].model, "openai/gpt-5-mini");
 		assert_eq!(targets[0].weight, 40);
+		assert!(targets[0].invalid);
 		assert_eq!(targets[1].model, "anthropic/claude-haiku-4-5");
 		assert_eq!(targets[1].weight, 60);
+		assert!(!targets[1].invalid);
 		Ok(())
 	}
 
@@ -5140,6 +5455,7 @@ mod tests {
 		let proto_route = proto::agent::ModelRoute {
 			key: "default/smart".to_string(),
 			listener_key: "default/gw.http".to_string(),
+			router_key: String::new(),
 			created: 0,
 			r#match: Some(proto::agent::model_route::Match {
 				model: "smart".to_string(),
@@ -5150,10 +5466,12 @@ mod tests {
 						conditional::Target {
 							model: "gpt-5-large".to_string(),
 							when: Some(r#"request.headers["x-tier"] == "premium""#.to_string()),
+							invalid: true,
 						},
 						conditional::Target {
 							model: "gpt-5-mini".to_string(),
 							when: None,
+							invalid: false,
 						},
 					],
 				})),
@@ -5173,8 +5491,10 @@ mod tests {
 		assert_eq!(targets.len(), 2);
 		assert_eq!(targets[0].model, "gpt-5-large");
 		assert!(targets[0].when.is_some());
+		assert!(targets[0].invalid);
 		assert_eq!(targets[1].model, "gpt-5-mini");
 		assert!(targets[1].when.is_none());
+		assert!(!targets[1].invalid);
 		Ok(())
 	}
 
@@ -5186,6 +5506,7 @@ mod tests {
 		let proto_route = proto::agent::ModelRoute {
 			key: "default/smart".to_string(),
 			listener_key: "default/gw.http".to_string(),
+			router_key: String::new(),
 			created: 0,
 			r#match: Some(proto::agent::model_route::Match {
 				model: "smart".to_string(),
@@ -5196,10 +5517,12 @@ mod tests {
 						conditional::Target {
 							model: "gpt-5-mini".to_string(),
 							when: None,
+							invalid: false,
 						},
 						conditional::Target {
 							model: "gpt-5-large".to_string(),
 							when: Some("true".to_string()),
+							invalid: false,
 						},
 					],
 				})),
@@ -5227,6 +5550,7 @@ mod tests {
 		let proto_route = proto::agent::ModelRoute {
 			key: "default/resilient".to_string(),
 			listener_key: "default/gw.http".to_string(),
+			router_key: String::new(),
 			created: 0,
 			r#match: Some(proto::agent::model_route::Match {
 				model: "resilient".to_string(),
@@ -5298,6 +5622,51 @@ mod tests {
 		let path = config.get_path();
 		assert!(path.starts_with("/runtimes/"));
 		assert!(path.contains("qualifier=v1"));
+		Ok(())
+	}
+
+	fn mcp_proto_backend(sse_keep_alive: Option<prost_types::Duration>) -> proto::agent::Backend {
+		proto::agent::Backend {
+			key: "test-ns/mcp-backend".to_string(),
+			name: Some(proto::agent::ResourceName {
+				name: "mcp-backend".to_string(),
+				namespace: "test-ns".to_string(),
+			}),
+			kind: Some(proto::agent::backend::Kind::Mcp(proto::agent::McpBackend {
+				targets: vec![],
+				stateful_mode: proto::agent::mcp_backend::StatefulMode::Stateless as i32,
+				prefix_mode: proto::agent::mcp_backend::PrefixMode::Conditional as i32,
+				failure_mode: proto::agent::mcp_backend::FailureMode::FailClosed as i32,
+				sse_keep_alive,
+			})),
+			inline_policies: vec![],
+		}
+	}
+
+	#[test]
+	fn test_backend_kind_mcp_sse_keep_alive_from_xds() -> Result<(), ProtoError> {
+		let proto_backend = mcp_proto_backend(Some(prost_types::Duration {
+			seconds: 10,
+			nanos: 0,
+		}));
+
+		let bw = backend_with_policies_from_proto(&proto_backend, &mut Diagnostics::default())?;
+		let Backend::MCP(_, mcp_backend) = &bw.backend else {
+			panic!("Expected Backend::MCP, got {:?}", bw.backend);
+		};
+		assert_eq!(mcp_backend.sse_keep_alive, Some(Duration::from_secs(10)));
+		Ok(())
+	}
+
+	#[test]
+	fn test_backend_kind_mcp_sse_keep_alive_unset_from_xds() -> Result<(), ProtoError> {
+		let proto_backend = mcp_proto_backend(None);
+
+		let bw = backend_with_policies_from_proto(&proto_backend, &mut Diagnostics::default())?;
+		let Backend::MCP(_, mcp_backend) = &bw.backend else {
+			panic!("Expected Backend::MCP, got {:?}", bw.backend);
+		};
+		assert_eq!(mcp_backend.sse_keep_alive, None);
 		Ok(())
 	}
 
@@ -5528,6 +5897,11 @@ mod tests {
 
 	#[test]
 	fn test_provider_connection_precedence() -> Result<(), ProtoError> {
+		for base_url in ["http://override.example", "http://override.example/"] {
+			let connection = provider_connection_from_url(base_url, 0)?;
+			assert_eq!(connection.path_prefix.as_deref(), Some("/"));
+		}
+
 		let explicit = resolve_provider_connection(
 			Some(llm::custom::ProviderPreset::Ollama),
 			Some("https://override.example/v2/"),
@@ -5645,6 +6019,7 @@ mod tests {
 			headers: Default::default(),
 			forward_header_matches: vec![],
 			failure_mode: 0,
+			action: 0,
 		};
 		let mut diag = Diagnostics::default();
 		let result = convert_webhook(&wh, &mut diag)?;
@@ -5669,6 +6044,7 @@ mod tests {
 			headers,
 			forward_header_matches: vec![],
 			failure_mode: 0,
+			action: 0,
 		};
 		let mut diag = Diagnostics::default();
 		let result = convert_webhook(&wh, &mut diag)?;
@@ -5697,6 +6073,7 @@ mod tests {
 			headers,
 			forward_header_matches: vec![],
 			failure_mode: 0,
+			action: 0,
 		};
 		let mut diag = Diagnostics::default();
 		let result = convert_webhook(&wh, &mut diag)?;
@@ -5722,6 +6099,7 @@ mod tests {
 			headers,
 			forward_header_matches: vec![],
 			failure_mode: 0,
+			action: 0,
 		};
 		let mut diag = Diagnostics::default();
 		// convert_webhook returns Result, but invalid header names produce warnings not errors
@@ -5742,6 +6120,84 @@ mod tests {
 				.into_warnings()
 				.iter()
 				.any(|w| w.contains("skipping webhook header"))
+		);
+	}
+
+	#[tokio::test]
+	async fn server_tls_config_from_proto_maps_spiffe_source() {
+		use proto::agent::tls_config::{CertificateSource, MtlsMode};
+
+		// mtls_mode is ignored for SPIFFE (client SVIDs are always required); a non-Strict mode warns.
+		let tls = proto::agent::TlsConfig {
+			certificate_source: CertificateSource::Spiffe as i32,
+			mtls_mode: MtlsMode::Disable as i32,
+			..Default::default()
+		};
+		let mut diags = Diagnostics::default();
+		let cfg =
+			server_tls_config_from_proto(&tls, &mut diags, crate::DynamicCaCertCacheConfig::default());
+
+		let err = cfg
+			.config_for(None, None, None)
+			.await
+			.expect_err("SPIFFE config_for should require a SpiffeClient");
+		assert!(
+			err.to_string().contains("SPIFFE source is required"),
+			"unexpected error: {err}"
+		);
+
+		assert!(
+			diags
+				.warnings
+				.iter()
+				.any(|w| w.contains("mtls_mode is ignored for SPIFFE")),
+			"expected the mtls_mode-ignored warning, got {:?}",
+			diags.warnings
+		);
+
+		// Strict is the clean path the controller emits for SPIFFE: no warning.
+		let strict = proto::agent::TlsConfig {
+			certificate_source: CertificateSource::Spiffe as i32,
+			mtls_mode: MtlsMode::Strict as i32,
+			..Default::default()
+		};
+		let mut strict_diags = Diagnostics::default();
+		let _ = server_tls_config_from_proto(
+			&strict,
+			&mut strict_diags,
+			crate::DynamicCaCertCacheConfig::default(),
+		);
+		assert!(
+			strict_diags.warnings.is_empty(),
+			"Strict mtls_mode should not warn for SPIFFE, got {:?}",
+			strict_diags.warnings
+		);
+	}
+
+	#[test]
+	fn backend_policy_from_proto_maps_spiffe_source() {
+		use crate::http::backendtls::BackendTLSSource;
+		use crate::types::proto::agent::backend_policy_spec as bps;
+
+		let spec = proto::agent::BackendPolicySpec {
+			kind: Some(bps::Kind::BackendTls(bps::BackendTls {
+				certificate_source: bps::backend_tls::CertificateSource::Spiffe as i32,
+				verify_subject_alt_names: vec!["spiffe://example.org/ns/default/sa/upstream".to_string()],
+				..Default::default()
+			})),
+		};
+		let policy = backend_policy_from_proto(&spec, &mut Diagnostics::default())
+			.expect("backend TLS policy should translate");
+
+		let BackendTrafficPolicy::BackendTLS(bt) = policy else {
+			panic!("expected a BackendTLS policy");
+		};
+		let BackendTLSSource::Spiffe(spiffe) = bt.source else {
+			panic!("expected a SPIFFE-sourced upstream TLS config");
+		};
+		assert_eq!(
+			spiffe.verify_sans,
+			vec!["spiffe://example.org/ns/default/sa/upstream".to_string()]
 		);
 	}
 }

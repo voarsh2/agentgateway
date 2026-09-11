@@ -11,7 +11,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use websocket_sans_io::{FrameInfo, Opcode, WebsocketFrameEncoder, WebsocketFrameEvent};
 
 use crate::llm::policy::PromptGuard;
-use crate::llm::{LLMInfo, LLMResponse};
+use crate::llm::{LLMInfo, LLMResponse, TokenGapSummary};
 use crate::proxy::httpproxy::PolicyClient;
 use crate::telemetry::log::AsyncLog;
 
@@ -76,6 +76,8 @@ impl<IO> Parser<IO> {
 						completion: None,
 						output_messages: None,
 						first_token: None,
+						last_token_at: None,
+						inter_chunk_latencies: TokenGapSummary::default(),
 						count_tokens: None,
 						reasoning_tokens: None,
 						cache_creation_input_tokens: None,
@@ -349,6 +351,7 @@ impl WsFrameAccumulator {
 ///   subsequent deltas for that response are dropped.
 /// - Preserves existing telemetry on `response.done`.
 /// - All non-text frames (audio, control, etc.) are forwarded immediately.
+#[allow(clippy::too_many_arguments)]
 pub async fn guarded_realtime_proxy<C, S>(
 	client: C,
 	server: S,
@@ -357,6 +360,7 @@ pub async fn guarded_realtime_proxy<C, S>(
 	log: AsyncLog<LLMInfo>,
 	req_headers: ::http::HeaderMap,
 	original: Option<std::sync::Arc<crate::cel::RequestSnapshot>>,
+	guardrail_log: crate::telemetry::log::GuardrailLog,
 ) where
 	C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 	S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -373,6 +377,7 @@ pub async fn guarded_realtime_proxy<C, S>(
 
 	let guard_clone = guard.clone();
 	let policy_client_clone = policy_client.clone();
+	let request_guardrail_log = guardrail_log.clone();
 	let log_clone = log.clone();
 	let original_clone = original.clone();
 
@@ -416,6 +421,7 @@ pub async fn guarded_realtime_proxy<C, S>(
 											input_text.trim(),
 											&policy_client,
 											original.as_deref(),
+											Some(&request_guardrail_log),
 										)
 										.await
 								{
@@ -445,6 +451,7 @@ pub async fn guarded_realtime_proxy<C, S>(
 				&policy_client_clone,
 				&req_headers,
 				original_clone,
+				guardrail_log,
 			);
 			let mut delta_hold: Vec<Bytes> = Vec::new();
 			let mut pending_text = String::new();
@@ -551,6 +558,8 @@ pub async fn guarded_realtime_proxy<C, S>(
 												completion: None,
 												output_messages: None,
 												first_token: None,
+												last_token_at: None,
+												inter_chunk_latencies: TokenGapSummary::default(),
 												count_tokens: None,
 												reasoning_tokens: None,
 												cache_creation_input_tokens: None,

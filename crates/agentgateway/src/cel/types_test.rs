@@ -46,6 +46,7 @@ fn build_test_request() -> crate::http::Request {
 	};
 	req.extensions_mut().insert(backend);
 	req.extensions_mut().insert(ProxyContext {
+		error: None,
 		bind: Some("bind".into()),
 		gateway: Some(ProxyGatewayContext {
 			namespace: "default".into(),
@@ -87,6 +88,7 @@ fn build_test_request() -> crate::http::Request {
 		provider_total_tokens: Some(150),
 		service_tier: None,
 		first_token: None,
+		inter_chunk_latencies: crate::llm::TokenGapSummary::default(),
 		time_to_first_token: Some(chrono::Duration::milliseconds(123).into()),
 		time_per_output_token: Some(chrono::Duration::milliseconds(7).into()),
 		count_tokens: None,
@@ -134,6 +136,7 @@ fn test_snapshot_matches_ref() {
 		Some(&snapshot),
 		None,
 		snapshot.llm.as_ref(),
+		None,
 		None,
 		None,
 		None,
@@ -289,7 +292,7 @@ fn llm_cost_is_exposed_to_cel_as_floats() {
 
 	let mut req = build_test_request();
 	// The exact Decimal breakdown is projected to f64 lazily, per field, on CEL access.
-	req.extensions_mut().get_mut::<LLMContext>().unwrap().cost = Some(llm::cost::Breakdown {
+	req.extensions_mut().get_mut::<LLMContext>().unwrap().cost = Some(llm::catalog::Breakdown {
 		input: dec("0.5"),
 		output: dec("0.025"),
 		cache_read: dec("0"),
@@ -327,6 +330,7 @@ fn test_route_metadata_context() {
 #[test]
 fn test_proxy_timing_is_native_duration() {
 	let proxy = ProxyContext {
+		error: None,
 		bind: None,
 		gateway: None,
 		listener: None,
@@ -335,7 +339,7 @@ fn test_proxy_timing_is_native_duration() {
 		upstream_duration: Some(chrono::Duration::milliseconds(675).into()),
 		response_processing_duration: Some(chrono::Duration::milliseconds(6).into()),
 	};
-	let executor = Executor::new_logger(None, None, None, None, None, Some(&proxy));
+	let executor = Executor::new_logger(None, None, None, None, None, None, Some(&proxy));
 	let expr = Expression::new_strict(
 		"proxy.requestProcessingDuration == duration('12ms') && \
 		 proxy.upstreamDuration == duration('675ms') && \
@@ -352,7 +356,7 @@ fn test_executor_snapshot_round_trip() {
 	let req_snapshot = snapshot_request(&mut req, true);
 
 	// Create executor from snapshot
-	let executor1 = Executor::new_logger(Some(&req_snapshot), None, None, None, None, None);
+	let executor1 = Executor::new_logger(Some(&req_snapshot), None, None, None, None, None, None);
 
 	// Serialize to JSON
 	let json = exec_to_json(&executor1);

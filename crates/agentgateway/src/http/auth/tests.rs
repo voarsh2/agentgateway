@@ -531,11 +531,20 @@ async fn test_aws_sign_request_explicit_region() {
 	aws::sign_request(&mut req, &aws_auth)
 		.await
 		.expect("signing failed");
-	// get the signature header
+	// Assert on the credential scope rather than the whole header: the signature
+	// covers `x-amz-date`, which comes from the wall clock, so two signings that
+	// straddle a UTC second boundary legitimately differ.
 	let auth = req
 		.headers()
 		.get(http::header::AUTHORIZATION)
-		.expect("authorization header must be set");
+		.expect("authorization header must be set")
+		.to_str()
+		.unwrap()
+		.to_string();
+	assert!(
+		auth.contains("/us-west-2/bedrock/"),
+		"credential scope must use the explicit region: {auth}"
+	);
 
 	// Part 2
 	// now, repeat with adefault region to make sure explicit region takes precedence
@@ -559,9 +568,19 @@ async fn test_aws_sign_request_explicit_region() {
 	let auth2 = req
 		.headers()
 		.get(http::header::AUTHORIZATION)
-		.expect("authorization header must be set");
+		.expect("authorization header must be set")
+		.to_str()
+		.unwrap()
+		.to_string();
 
-	assert_eq!(auth, auth2, "Signatures should match with explicit region");
+	assert!(
+		auth2.contains("/us-west-2/bedrock/"),
+		"explicit region must win over the AwsRegion extension: {auth2}"
+	);
+	assert!(
+		!auth2.contains("eu-central-1"),
+		"the extension region must not be used when a region is configured: {auth2}"
+	);
 }
 
 #[tokio::test]
@@ -1011,7 +1030,7 @@ async fn test_backend_auth_combined_key_and_credentials() {
 }
 
 #[tokio::test]
-async fn test_backend_auth_credentials_invalid_value_errors() {
+async fn test_backend_auth_credentials_invalid_value_is_local() {
 	let mut req = crate::http::Request::new(crate::http::Body::empty());
 	let t = setup_proxy_test("{}").expect("setup proxy inputs");
 	let inputs = t.inputs();
@@ -1030,8 +1049,17 @@ async fn test_backend_auth_credentials_invalid_value_errors() {
 		kind: None,
 		credentials: vec![credential("x-bad", "value\nwith\nnewlines", None)],
 	};
-	let err = apply_backend_auth(&backend_info, &auth, &mut req).await;
-	assert!(err.is_err(), "invalid header value must error");
+	let err = apply_backend_auth(&backend_info, &auth, &mut req)
+		.await
+		.expect_err("invalid header value must error");
+	assert!(matches!(
+		&err,
+		ProxyError::BackendAuthenticationFailed(BackendAuthError::Local(_))
+	));
+	assert_eq!(
+		err.into_response_with_grpc(false).status(),
+		http::StatusCode::INTERNAL_SERVER_ERROR
+	);
 }
 
 #[test]

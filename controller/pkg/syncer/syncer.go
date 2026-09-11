@@ -10,7 +10,6 @@ import (
 	"istio.io/istio/pilot/pkg/serviceregistry/ambient"
 	"istio.io/istio/pkg/cluster"
 	"istio.io/istio/pkg/config/mesh"
-	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/kube/krt"
 	"istio.io/istio/pkg/maps"
 	"istio.io/istio/pkg/slices"
@@ -213,11 +212,9 @@ func (s *Syncer) buildFinalGatewayStatus(
 		gatewayStatuses,
 		func(ctx krt.HandlerContext, i krt.ObjectWithStatus[*gwv1.Gateway, gwv1.GatewayStatus]) *krt.ObjectWithStatus[*gwv1.Gateway, gwv1.GatewayStatus] {
 			routes := krt.Fetch(ctx, routeAttachments, krt.FilterIndex(routeAttachmentsIndex, utils.TypedNamespacedName{
-				Kind: wellknown.GatewayGVK.Kind,
-				NamespacedName: types.NamespacedName{
-					Namespace: i.Obj.Namespace,
-					Name:      i.Obj.Name,
-				},
+				Kind:      wellknown.GatewayGVK.Kind,
+				Namespace: i.Obj.Namespace,
+				Name:      i.Obj.Name,
 			}))
 			counts := map[string]int32{}
 			for _, r := range routes {
@@ -247,10 +244,8 @@ func (s *Syncer) buildFinalListenerSetStatus(
 
 	gatewayIndex := krt.NewIndex(gateways, "gateway-parent-section-name", func(gwl *translator.GatewayListener) []utils.SectionedNamespacedName {
 		return []utils.SectionedNamespacedName{{
-			NamespacedName: types.NamespacedName{
-				Namespace: gwl.ParentObject.Namespace,
-				Name:      gwl.ParentObject.Name,
-			},
+			Namespace:   gwl.ParentObject.Namespace,
+			Name:        gwl.ParentObject.Name,
 			SectionName: gwl.ParentInfo.SectionName,
 		}}
 	}).AsCollection(append(krtopts.ToOptions("translator/ListenerSetListenersByParentSection"), utils.SectionedNamespacedNameIndexCollectionFunc)...)
@@ -264,11 +259,9 @@ func (s *Syncer) buildFinalListenerSetStatus(
 			invalidListenerCount := 0
 			lsStatus := i.Status.DeepCopy()
 			routes := krt.Fetch(ctx, routeAttachments, krt.FilterIndex(routeAttachmentsIndex, utils.TypedNamespacedName{
-				Kind: wellknown.ListenerSetGVK.Kind,
-				NamespacedName: types.NamespacedName{
-					Namespace: i.Obj.Namespace,
-					Name:      i.Obj.Name,
-				},
+				Kind:      wellknown.ListenerSetGVK.Kind,
+				Namespace: i.Obj.Namespace,
+				Name:      i.Obj.Name,
 			}))
 			counts := map[string]int32{}
 			for _, r := range routes {
@@ -276,10 +269,8 @@ func (s *Syncer) buildFinalListenerSetStatus(
 			}
 			for idx, l := range i.Obj.Spec.Listeners {
 				gatewayListeners := krtutil.FetchIndexObjects(ctx, gatewayIndex, utils.SectionedNamespacedName{
-					NamespacedName: types.NamespacedName{
-						Namespace: i.Obj.Namespace,
-						Name:      i.Obj.Name,
-					},
+					Namespace:   i.Obj.Namespace,
+					Name:        i.Obj.Name,
 					SectionName: l.Name,
 				})
 				if len(gatewayListeners) == 0 {
@@ -491,9 +482,10 @@ func (s *Syncer) buildAgwResources(
 	baseAgwRoutes, routeAttachments, ancestorBackends := translator.AgwRouteCollection(s.statusCollections, s.agwCollections.HTTPRoutes, s.agwCollections.GRPCRoutes, s.agwCollections.TCPRoutes, s.agwCollections.TLSRoutes, routeInputs, krtopts)
 	routeCollections := []krt.Collection[agwir.AgwResource]{baseAgwRoutes}
 	if s.agwCollections.Settings.EnableAgentgatewayModels {
-		modelResources, modelAttachments := translator.AgwModelCollection(s.statusCollections, s.agwCollections.Models, routeInputs, krtopts)
+		modelResources, modelAttachments, modelAncestors := translator.AgwModelCollection(s.statusCollections, s.agwCollections.Models, routeInputs, krtopts)
 		routeAttachments = krt.JoinCollection([]krt.Collection[*plugins.RouteAttachment]{routeAttachments, modelAttachments}, krtopts.ToOptions("translator/RouteAttachmentsWithModels")...)
 		routeCollections = append(routeCollections, modelResources)
+		ancestorBackends = krt.JoinCollection([]krt.Collection[*utils.AncestorBackend]{ancestorBackends, modelAncestors}, krtopts.ToOptions("translator/AncestorBackendsWithModels")...)
 	}
 	if s.agwPlugins.AddResourceExtension != nil {
 		if s.agwPlugins.AddResourceExtension.Routes != nil {
@@ -597,8 +589,8 @@ func (s *Syncer) buildBindsFromGateway(listeners []*translator.GatewayListener) 
 		// non-overlapping. This case doesn't need to be handled here since the generated bind is independent of
 		// hostname
 		if listener.Conflict == "" {
-			bi.protocol = s.getBindProtocol(listener)
-			if tp := s.getTunnelProtocol(listener); tp != api.Bind_DIRECT {
+			bi.protocol = translator.BindProtocol(listener.ParentInfo.Protocol)
+			if tp := translator.TunnelProtocol(listener.ParentInfo.Protocol); tp != api.Bind_DIRECT {
 				bi.tunnelProtocol = tp
 			}
 			// A bind is internal if any contributing listener marks it internal. Translation
@@ -647,7 +639,7 @@ func (s *Syncer) buildListenerFromGateway(obj *translator.GatewayListener) *agwi
 	}
 
 	// Set protocol and TLS configuration
-	protocol, tlsConfig, ok := s.getProtocolAndTLSConfig(obj)
+	protocol, tlsConfig, ok := translator.ListenerProtocolAndTLSConfig(obj)
 	if !ok {
 		return nil // Unsupported protocol or missing TLS config
 	}
@@ -659,95 +651,6 @@ func (s *Syncer) buildListenerFromGateway(obj *translator.GatewayListener) *agwi
 		Namespace: obj.ParentGateway.Namespace,
 		Name:      obj.ParentGateway.Name,
 	}, translator.AgwListener{Listener: l}))
-}
-
-// getProtocolAndTLSConfig extracts protocol and TLS configuration from a gateway
-func (s *Syncer) getProtocolAndTLSConfig(obj *translator.GatewayListener) (api.Protocol, *api.TLSConfig, bool) {
-	var tlsConfig *api.TLSConfig
-
-	// Build TLS config if needed
-	if obj.TLSInfo != nil {
-		tlsConfig = &api.TLSConfig{
-			Cert:       obj.TLSInfo.Cert,
-			PrivateKey: obj.TLSInfo.Key,
-		}
-		if obj.TLSInfo.IstioWorkloadCert {
-			tlsConfig.CertificateSource = api.TLSConfig_ISTIO_WORKLOAD
-		} else if obj.TLSInfo.DynamicCA {
-			tlsConfig.CertificateSource = api.TLSConfig_DYNAMIC_CA
-		}
-		if len(obj.TLSInfo.CaCert) > 0 {
-			tlsConfig.Root = obj.TLSInfo.CaCert
-		}
-		if obj.TLSInfo.IstioMutual {
-			tlsConfig.Root = nil
-			tlsConfig.MtlsMode = api.TLSConfig_STRICT
-		} else if obj.TLSInfo.IstioWorkloadCert {
-			tlsConfig.MtlsMode = api.TLSConfig_DISABLE
-		} else if obj.TLSInfo.MtlsFallbackEnabled {
-			tlsConfig.MtlsMode = api.TLSConfig_ALLOW_INSECURE_FALLBACK
-		}
-	}
-
-	switch obj.ParentInfo.Protocol {
-	case gwv1.HTTPProtocolType:
-		return api.Protocol_HTTP, nil, true
-	case gwv1.HTTPSProtocolType:
-		if tlsConfig == nil {
-			return api.Protocol_HTTPS, nil, false // TLS required but not configured
-		}
-		return api.Protocol_HTTPS, tlsConfig, true
-	case gwv1.TLSProtocolType:
-		if tlsConfig == nil {
-			if obj.ParentInfo.TLSPassthrough {
-				// For passthrough, we don't want TLS config
-				return api.Protocol_TLS, nil, true
-			} else {
-				// TLS required but not configured
-				return api.Protocol_TLS, nil, false
-			}
-		}
-		return api.Protocol_TLS, tlsConfig, true
-	case gwv1.TCPProtocolType:
-		return api.Protocol_TCP, nil, true
-	case gwv1.ProtocolType(protocol.HBONE):
-		return api.Protocol_HBONE, nil, true
-	default:
-		return api.Protocol_HTTP, nil, false // Unsupported protocol
-	}
-}
-
-// getProtocolAndTLSConfig extracts protocol and TLS configuration from a gateway
-func (s *Syncer) getBindProtocol(obj *translator.GatewayListener) api.Bind_Protocol {
-	switch obj.ParentInfo.Protocol {
-	case gwv1.HTTPProtocolType:
-		return api.Bind_HTTP
-	case gwv1.HTTPSProtocolType:
-		return api.Bind_TLS
-	case gwv1.TLSProtocolType:
-		return api.Bind_TLS
-	case gwv1.TCPProtocolType:
-		return api.Bind_TCP
-	case gwv1.ProtocolType(protocol.HBONE):
-		// The bind protocol is not used for HBONE_GATEWAY in the data plane;
-		// the actual inner protocol is determined at runtime from the other
-		// listeners on the same port. Return HTTP as a placeholder.
-		return api.Bind_HTTP
-	default:
-		return api.Bind_HTTP
-	}
-}
-
-// getTunnelProtocol maps a Gateway listener protocol to its tunnel protocol.
-// HBONE listeners use HBONE_GATEWAY mode: the proxy terminates inbound HBONE
-// and routes CONNECT requests to local binds.
-func (s *Syncer) getTunnelProtocol(obj *translator.GatewayListener) api.Bind_TunnelProtocol {
-	switch obj.ParentInfo.Protocol {
-	case gwv1.ProtocolType(protocol.HBONE):
-		return api.Bind_HBONE_GATEWAY
-	default:
-		return api.Bind_DIRECT
-	}
 }
 
 // defaultBuildAddressCollections is the default implementation for building address collections
