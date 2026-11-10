@@ -917,7 +917,10 @@ pub fn passthrough_stream(
 	resp.map(|b| {
 		parse::sse::permissive_json_passthrough::<StreamResponse>(b, buffer_limit, move |f| match f {
 			Some(Ok(f)) => amend_from_stream_response(&mut log, &f),
-			Some(Err(e)) => debug!("failed to parse streaming response: {e}"),
+			Some(Err(e)) => {
+				log.mark_failed();
+				debug!("failed to parse streaming response: {e}");
+			},
 			None => {},
 		})
 	})

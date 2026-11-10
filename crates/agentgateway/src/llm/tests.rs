@@ -2513,7 +2513,6 @@ async fn process_response_routes_streaming_error_to_buffered_path() {
 			None,
 			Default::default(),
 			None,
-			AsyncLog::default(),
 			resp,
 		)
 		.await
@@ -2568,7 +2567,6 @@ async fn upstream_encoding_is_applied_after_messages_response_translation() {
 			None,
 			Default::default(),
 			None,
-			AsyncLog::default(),
 			upstream,
 		)
 		.await
@@ -2795,7 +2793,6 @@ async fn process_streaming_bedrock_completions_normalizes_sse_headers_and_done()
 			None,
 			Default::default(),
 			None,
-			AsyncLog::default(),
 			resp,
 		)
 		.expect("Bedrock streaming translation should succeed");

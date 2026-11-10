@@ -446,10 +446,6 @@ impl LLMInfo {
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct LLMResponse {
-	/// The provider reported an application-level failure in an otherwise successful
-	/// HTTP response (for example, a Responses API `response.failed` event).
-	#[serde(skip)]
-	pub failed: bool,
 	/// Provider-reported input tokens. Whether this includes cache tokens is described by the
 	/// corresponding request's [`CacheTokenConvention`].
 	#[serde(skip_serializing_if = "Option::is_none")]

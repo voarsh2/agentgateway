@@ -866,6 +866,10 @@ impl DropOnLog {
 		status: Option<crate::http::StatusCode>,
 		cel_exec: &CelLoggingExecutor<'_>,
 	) -> bool {
+		// Provider parsing and body failures take precedence over configured CEL health checks.
+		if log.attempt_provider_failed.load().unwrap_or(false) {
+			return true;
+		}
 		let default_unhealthy = Self::default_unhealthy_for_status(log, status);
 		let Some(policy) = &log.health_policy else {
 			return default_unhealthy;
@@ -1167,6 +1171,7 @@ impl RequestLog {
 			outgoing_span: None,
 			llm_request: None,
 			llm_response: Default::default(),
+			attempt_provider_failed: Default::default(),
 			original_model: None,
 			guardrails: Default::default(),
 			mcp_guardrails: Default::default(),
@@ -1358,6 +1363,8 @@ pub struct RequestLog {
 
 	pub llm_request: Option<llm::LLMRequest>,
 	pub llm_response: AsyncLog<llm::LLMInfo>,
+	/// Provider-side failure observed for the current upstream attempt.
+	pub attempt_provider_failed: AsyncLog<bool>,
 	pub original_model: Option<String>,
 	pub guardrails: GuardrailLog,
 	pub mcp_guardrails: McpGuardrailsLog,
@@ -2366,10 +2373,11 @@ impl Drop for DropOnLog {
 impl agent_http::BodyObserver for DropOnLog {
 	fn on_error(&mut self, error: &crate::http::Error) {
 		// Response headers have already been sent; retain the body failure in the log.
-		if let Some(log) = self.as_mut()
-			&& log.error.is_none()
-		{
-			log.error = Some(format!("response body failed: {error}"));
+		if let Some(log) = self.as_mut() {
+			log.attempt_provider_failed.store(Some(true));
+			if log.error.is_none() {
+				log.error = Some(format!("response body failed: {error}"));
+			}
 		}
 	}
 	fn on_frame(&mut self, frame: &Frame<Bytes>) {

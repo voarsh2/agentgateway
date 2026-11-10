@@ -1296,6 +1296,7 @@ impl HTTPProxy {
 						&res,
 						retries.as_ref().unwrap(),
 						log.request_snapshot.as_deref(),
+						log.attempt_provider_failed.load().unwrap_or(false),
 					)
 				};
 			if !retryable {
@@ -1606,6 +1607,8 @@ impl HTTPProxy {
 		mut req: Request,
 		substrate_state: &mut Option<http::substrate::SubstrateRequestState>,
 	) -> Result<Response, ProxyError> {
+		// This state describes one provider attempt; a later fallback must start clean.
+		log.attempt_provider_failed.store(Some(false));
 		if let Some(backend_timeout) = response_policies
 			.timeout
 			.as_ref()
@@ -3232,11 +3235,13 @@ async fn make_backend_call(
 	let llm_logging = log.as_ref().map(|l| llm::LLMLogging {
 		response: l.llm_response.clone(),
 		guardrails: l.guardrails.clone(),
+		attempt_provider_failed: l.attempt_provider_failed.clone(),
 		content: llm::LogContentFields {
 			completion: l.cel.cel_context.needs_llm_completion(),
 			tool_calls: l.cel.cel_context.needs_llm_tool_calls(),
 		},
 	});
+	let attempt_provider_failed = log.as_ref().map(|l| l.attempt_provider_failed.clone());
 	let a2a_type = response_policies.a2a_type.clone();
 
 	let outbound_subtype = if backend_call.backend_policies.llm_provider.is_some() {
@@ -3338,6 +3343,7 @@ async fn make_backend_call(
 			l.a2a_response = Some(a2a_response);
 		});
 	}
+	let upstream_status = resp.status();
 	let mut resp = if let (Some(llm), Some(llm_request)) = (
 		backend_call.backend_policies.llm_provider.clone(),
 		llm_request,
@@ -3357,7 +3363,15 @@ async fn make_backend_call(
 				.assert_size::<{ LLM_PROCESS_RESPONSE_FUTURE_SIZE }>(),
 		)
 		.await
-		.map_err(ProxyError::AIResponse)?
+		.map_err(|error| {
+			// A successful HTTP response that fails LLM response processing is a provider failure.
+			if upstream_status.is_success()
+				&& let Some(marker) = &attempt_provider_failed
+			{
+				marker.store(Some(true));
+			}
+			ProxyError::AIResponse(error)
+		})?
 	} else {
 		resp
 	};
@@ -3940,7 +3954,11 @@ fn should_retry(
 	res: &Result<Response, SnapshottedProxyError>,
 	pol: &retry::Policy,
 	req_snapshot: Option<&cel::RequestSnapshot>,
+	provider_failed: bool,
 ) -> bool {
+	if provider_failed {
+		return true;
+	}
 	match res {
 		Ok(resp) => {
 			if pol.codes.contains(&resp.status()) {
@@ -4176,14 +4194,14 @@ mod tests {
 			.status(503)
 			.body(http::Body::empty())
 			.unwrap();
-		assert!(super::should_retry(&Ok(resp), &pol, None));
+		assert!(super::should_retry(&Ok(resp), &pol, None, false));
 
 		let pol = retry_policy(&[503], None);
 		let resp = ::http::Response::builder()
 			.status(200)
 			.body(http::Body::empty())
 			.unwrap();
-		assert!(!super::should_retry(&Ok(resp), &pol, None));
+		assert!(!super::should_retry(&Ok(resp), &pol, None, false));
 	}
 
 	#[test]
@@ -4203,14 +4221,14 @@ mod tests {
 			.header("x-req-failed", "true")
 			.body(http::Body::empty())
 			.unwrap();
-		assert!(super::should_retry(&Ok(failed), &pol, None));
+		assert!(super::should_retry(&Ok(failed), &pol, None, false));
 
 		let pol = retry_policy(&[], Some(r#"response.headers["x-req-failed"] == "true""#));
 		let ok = ::http::Response::builder()
 			.status(200)
 			.body(http::Body::empty())
 			.unwrap();
-		assert!(!super::should_retry(&Ok(ok), &pol, None));
+		assert!(!super::should_retry(&Ok(ok), &pol, None, false));
 	}
 
 	#[test]

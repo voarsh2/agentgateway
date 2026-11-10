@@ -355,6 +355,7 @@ pub struct LLMLogging {
 	pub response: AsyncLog<LLMInfo>,
 	pub guardrails: GuardrailLog,
 	pub content: LogContentFields,
+	pub attempt_provider_failed: AsyncLog<bool>,
 }
 
 // Context provider to each response translation (streaming)
@@ -2728,7 +2729,6 @@ impl AIProvider {
 		req_snapshot: Option<Arc<RequestSnapshot>>,
 		logging: LLMLogging,
 		model_catalog: Option<&Arc<catalog::ModelCatalog>>,
-		attempt_provider_failed: AsyncLog<bool>,
 		resp: Response,
 	) -> Result<Response, AIError> {
 		// Detect requests are opaque, so the response decides how it is handled: event streams are
@@ -2772,7 +2772,6 @@ impl AIProvider {
 				req_snapshot,
 				logging,
 				model_catalog.cloned(),
-				attempt_provider_failed,
 				resp,
 			);
 		}
@@ -2854,6 +2853,7 @@ impl AIProvider {
 			response: log,
 			guardrails: guardrail_log,
 			content: log_content,
+			..
 		} = logging;
 		let BufferedResponse {
 			mut parts,
@@ -3285,13 +3285,13 @@ impl AIProvider {
 		req_snapshot: Option<Arc<RequestSnapshot>>,
 		logging: LLMLogging,
 		model_catalog: Option<Arc<catalog::ModelCatalog>>,
-		attempt_provider_failed: AsyncLog<bool>,
 		resp: Response,
 	) -> Result<Response, AIError> {
 		let LLMLogging {
 			response: log,
 			guardrails: guardrail_log,
 			content: log_content,
+			attempt_provider_failed,
 		} = logging;
 		let model = req.request_model.clone();
 		let input_format = req.input_format;
@@ -3826,9 +3826,6 @@ impl agent_llm::StreamingUsageReporter for AmendOnDrop {
 		if let Some(marker) = &self.failure_marker {
 			marker.store(Some(true));
 		}
-		self
-			.log
-			.non_atomic_mutate(|info| info.response.failed = true);
 	}
 
 	fn report_usage(&mut self) {
