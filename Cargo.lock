@@ -155,6 +155,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_with",
+ "sha2 0.11.1",
  "thiserror 2.0.21",
  "tiktoken",
  "tokio",
