@@ -20,7 +20,14 @@ pub mod from_responses {
 	}
 
 	pub fn translate_request(req: &types::responses::Request) -> Result<TranslatedRequest, AIError> {
-		let mut typed = json::convert::<_, responses::CreateResponse>(req)
+		// Responses include values have no Chat Completions equivalent. Newer Codex
+		// clients may send output.encrypted_content, which this older typed schema
+		// does not recognize, so strip include only on this conversion path.
+		let mut request = req.clone();
+		if let Some(rest) = request.rest.as_object_mut() {
+			rest.remove("include");
+		}
+		let mut typed = json::convert::<_, responses::CreateResponse>(&request)
 			.map_err(|err| AIError::RequestParsing(crate::InputFormat::Responses, err))?;
 		let namespaces =
 			crate::conversion::namespace_tools::NamespaceToolMap::rewrite_request(&mut typed)?;
@@ -49,9 +56,12 @@ pub mod from_responses {
 		let mut gemini_signatures = std::collections::HashMap::new();
 
 		if let Some(instructions) = &req.instructions {
-			messages.push(completions::RequestMessage::Developer(
-				completions::RequestDeveloperMessage {
-					content: completions::RequestDeveloperMessageContent::Text(instructions.clone()),
+			// Some Chat Completions-compatible providers (including Z.AI Coding Plan)
+			// reject developer messages. Responses instructions have no exact Chat
+			// equivalent, so map them to the broadly supported system role.
+			messages.push(completions::RequestMessage::System(
+				completions::RequestSystemMessage {
+					content: completions::RequestSystemMessageContent::Text(instructions.clone()),
 					name: None,
 				},
 			));
@@ -236,15 +246,15 @@ pub mod from_responses {
 								));
 							},
 							InputRole::Developer => {
-								messages.push(completions::RequestMessage::Developer(
-									completions::RequestDeveloperMessage {
-										content: completions::RequestDeveloperMessageContent::Array(
+								messages.push(completions::RequestMessage::System(
+									completions::RequestSystemMessage {
+										content: completions::RequestSystemMessageContent::Array(
 											msg
 												.content
 												.into_iter()
 												.filter_map(|content| match content {
 													InputContent::InputText(text) => {
-														Some(completions::RequestDeveloperMessageContentPart::Text(
+														Some(completions::RequestSystemMessageContentPart::Text(
 															completions::RequestMessageContentPartText {
 																text: text.text,
 																prompt_cache_breakpoint: cache_breakpoint(
