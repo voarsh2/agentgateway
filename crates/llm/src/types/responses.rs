@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 
 use self::typed::{
 	EasyInputContent, EasyInputMessage, InputContent, InputItem, InputMessage, InputRole,
@@ -867,6 +869,92 @@ impl From<SimpleChatCompletionMessage> for InputItem {
 }
 
 impl Request {
+	fn is_valid_id(id: &str, prefix: &str) -> bool {
+		id.starts_with(prefix)
+			&& id.len() <= 64
+			&& id
+				.bytes()
+				.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+	}
+
+	fn bounded_id(prefix: &str, original: &str) -> String {
+		// Hex is deliberately used instead of base64url: it only contains
+		// letters and digits, which is accepted by stricter OpenAI-compatible
+		// providers as well as the documented Responses ID character set.
+		let digest = Sha256::digest(original.as_bytes());
+		let encoded = digest
+			.iter()
+			.map(|byte| format!("{byte:02x}"))
+			.collect::<String>();
+		let suffix_len = 64usize.saturating_sub(prefix.len());
+		format!("{prefix}{}", &encoded[..suffix_len.min(encoded.len())])
+	}
+
+	/// Canonicalize provider-specific Responses item and call IDs before
+	/// forwarding a request across providers.
+	///
+	/// Strict Responses providers require type-specific item ID prefixes and
+	/// cap IDs at 64 characters. Call IDs are normalized only when invalid, and
+	/// a consistent mapping is applied to matching tool outputs.
+	pub fn canonicalize_tool_call_item_ids(&mut self) -> usize {
+		let RequestInput::Items(items) = &mut self.input else {
+			return 0;
+		};
+
+		let mut normalized = 0;
+		let mut call_id_map = HashMap::new();
+		for RawInputItem(item) in items.iter_mut() {
+			let Some(item) = item.as_object_mut() else {
+				continue;
+			};
+			let expected_prefix = match item.get("type").and_then(Value::as_str) {
+				Some("function_call") => "fc_",
+				Some("custom_tool_call") => "ctc_",
+				Some("web_search_call") => "ws_",
+				_ => continue,
+			};
+			let Some(id) = item.get("id").and_then(Value::as_str).map(str::to_string) else {
+				continue;
+			};
+			if !Self::is_valid_id(&id, expected_prefix) {
+				item.insert(
+					"id".to_string(),
+					Value::String(Self::bounded_id(expected_prefix, &id)),
+				);
+				normalized += 1;
+			}
+		}
+
+		// Outputs may remain after context trimming even when their originating
+		// calls do not, so collect call IDs from every input item first.
+		for RawInputItem(item) in items.iter() {
+			let Some(call_id) = item.get("call_id").and_then(Value::as_str) else {
+				continue;
+			};
+			if !Self::is_valid_id(call_id, "call_") {
+				call_id_map
+					.entry(call_id.to_string())
+					.or_insert_with(|| Self::bounded_id("call_", call_id));
+			}
+		}
+
+		if !call_id_map.is_empty() {
+			for RawInputItem(item) in items.iter_mut() {
+				let Some(object) = item.as_object_mut() else {
+					continue;
+				};
+				let Some(call_id) = object.get("call_id").and_then(Value::as_str) else {
+					continue;
+				};
+				if let Some(mapped) = call_id_map.get(call_id) {
+					object.insert("call_id".to_string(), Value::String(mapped.clone()));
+					normalized += 1;
+				}
+			}
+		}
+		normalized
+	}
+
 	fn take_input_as_items(&mut self) -> Vec<RawInputItem> {
 		match std::mem::replace(&mut self.input, RequestInput::Items(Vec::new())) {
 			RequestInput::Text(text) => vec![RawInputItem::from_user_text(text)],
