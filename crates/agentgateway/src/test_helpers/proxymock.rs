@@ -8,7 +8,7 @@ use std::time::Instant;
 use agent_core::drain::{DrainTrigger, DrainWatcher};
 use agent_core::strng::Strng;
 use agent_core::{drain, metrics, strng};
-use axum::body::to_bytes;
+use agent_http::Body;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Uri};
 use hyper_util::client::legacy::Client;
@@ -25,8 +25,8 @@ use tracing::{info, trace};
 use wiremock::tls_certs::MockTlsCertificates;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+use crate::http::Response;
 use crate::http::backendtls::BackendTLS;
-use crate::http::{Body, Response};
 use crate::llm::{AIBackend, AIProvider, NamedAIProvider, catalog};
 use crate::mcp::FailureMode;
 use crate::proxy::Gateway;
@@ -227,7 +227,7 @@ pub fn custom_llm_backend_with_formats(
 	let provider = NamedAIProvider {
 		name: "default".into(),
 		provider: AIProvider::Custom(crate::llm::custom::Provider {
-			model: None,
+			model_override: None,
 			provider_override: None,
 			formats,
 		}),
@@ -241,7 +241,7 @@ pub fn custom_llm_backend_with_formats(
 	let providers = EndpointSet::new(vec![vec![(provider.name.clone(), provider)]]);
 	Backend::AI(
 		ResourceName::new(name.into(), "".into()),
-		AIBackend { providers },
+		AIBackend::new(providers),
 	)
 	.into()
 }
@@ -316,6 +316,7 @@ pub fn simple_bind() -> BindSnapshot {
 			name: Default::default(),
 			hostname: Default::default(),
 			protocol: ListenerProtocol::HTTP,
+			..Default::default()
 		}])),
 	}
 }
@@ -339,6 +340,7 @@ pub fn waypoint_bind(protocol: ListenerProtocol) -> BindSnapshot {
 			},
 			hostname: Default::default(),
 			protocol,
+			..Default::default()
 		}])),
 	}
 }
@@ -358,6 +360,7 @@ pub fn simple_tcp_bind() -> BindSnapshot {
 			name: Default::default(),
 			hostname: Default::default(),
 			protocol: ListenerProtocol::TCP,
+			..Default::default()
 		}])),
 	}
 }
@@ -753,6 +756,7 @@ impl TestBind {
 			McpBackend {
 				targets: vec![Arc::new(McpTarget {
 					name: "mcp".into(),
+					condition: None,
 					spec: if !legacy_sse {
 						McpTargetSpec::Mcp(StreamableHTTPTargetSpec {
 							backend: sb,
@@ -771,6 +775,7 @@ impl TestBind {
 				session_idle_ttl: crate::mcp::DEFAULT_SESSION_IDLE_TTL,
 				sse_keep_alive: None,
 				dns_rebinding_protection,
+				server: None,
 			},
 		);
 		{
@@ -816,6 +821,7 @@ impl TestBind {
 			vec![],
 			Default::default(),
 			failure_mode,
+			vec![],
 		)
 	}
 
@@ -850,9 +856,29 @@ impl TestBind {
 			policies,
 			prefix_mode,
 			FailureMode::FailClosed,
+			vec![],
 		)
 	}
 
+	pub fn with_multiplex_mcp_backend_target_conditions(
+		self,
+		name: &str,
+		servers: Vec<(&str, SocketAddr, bool)>,
+		stateful: bool,
+		conditions: Vec<Option<Arc<crate::cel::Expression>>>,
+	) -> Self {
+		self.with_multiplex_mcp_backend_options(
+			name,
+			servers,
+			stateful,
+			vec![],
+			Default::default(),
+			FailureMode::FailClosed,
+			conditions,
+		)
+	}
+
+	#[allow(clippy::too_many_arguments)]
 	fn with_multiplex_mcp_backend_options(
 		self,
 		name: &str,
@@ -861,16 +887,19 @@ impl TestBind {
 		policies: Vec<BackendTrafficPolicy>,
 		prefix_mode: crate::types::agent::McpPrefixMode,
 		failure_mode: FailureMode,
+		conditions: Vec<Option<Arc<crate::cel::Expression>>>,
 	) -> Self {
 		let b = Backend::MCP(
 			ResourceName::new(name.into(), "".into()),
 			McpBackend {
 				targets: servers
 					.iter()
-					.map(|(name, addr, legacy_sse)| {
+					.zip(conditions.into_iter().chain(std::iter::repeat(None)))
+					.map(|((name, addr, legacy_sse), condition)| {
 						let sb = SimpleBackendReference::Backend(strng::format!("/basic-{}", addr));
 						Arc::new(McpTarget {
 							name: strng::new(name),
+							condition,
 							spec: if !legacy_sse {
 								McpTargetSpec::Mcp(StreamableHTTPTargetSpec {
 									backend: sb,
@@ -891,6 +920,7 @@ impl TestBind {
 				session_idle_ttl: crate::mcp::DEFAULT_SESSION_IDLE_TTL,
 				sse_keep_alive: None,
 				dns_rebinding_protection: false,
+				server: None,
 			},
 		);
 		{
@@ -1041,6 +1071,14 @@ impl TestBind {
 		}
 	}
 	pub async fn attach_frontend_policy(&mut self, p: serde_json::Value) {
+		self.attach_frontend_policy_with_port(p, None).await;
+	}
+
+	pub async fn attach_frontend_policy_with_port(
+		&mut self,
+		p: serde_json::Value,
+		port: Option<u16>,
+	) {
 		let cfg = serde_json::json!({
 			"frontendPolicies": p,
 		});
@@ -1059,7 +1097,10 @@ impl TestBind {
 			.budget_policy
 			.apply_registration(normalized.budget_registration.clone())
 			.unwrap();
-		for v in normalized.policies.into_iter() {
+		for mut v in normalized.policies.into_iter() {
+			if let PolicyTarget::Gateway(target) = &mut v.target {
+				target.port = port;
+			}
 			self.policies += 1;
 			self.with_policy(TargetedPolicy {
 				key: strng::format!("pol/{}", self.policies),
@@ -1083,6 +1124,7 @@ impl TestBind {
 					name: addr.to_string().into(),
 					namespace: Default::default(),
 					section: None,
+					kind: None,
 				}),
 				inheritance: Default::default(),
 				policy: v.into(),
@@ -1401,6 +1443,23 @@ impl TestBind {
 		addr
 	}
 
+	/// Only listeners started with `serve_gateway_listener` release their drain handle; other serve_*
+	/// helpers hold one for the life of the test, so a drain after them never completes.
+	pub async fn start_drain(self) {
+		let Self {
+			_drain_tx: drain_tx,
+			drain_rx,
+			..
+		} = self;
+		drop(drain_rx);
+		tokio::time::timeout(
+			std::time::Duration::from_secs(30),
+			drain_tx.start_drain_and_wait(drain::DrainMode::Graceful),
+		)
+		.await
+		.expect("drain did not complete; something still holds a DrainWatcher")
+	}
+
 	pub async fn serve_gateway_listener(&self, bind_name: BindKey) -> SocketAddr {
 		let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
 		listener.set_nonblocking(true).unwrap();
@@ -1440,15 +1499,17 @@ pub fn setup_proxy_test_with_spiffe(
 }
 
 pub fn setup_proxy_test_with_config_and_spiffe(
-	config: crate::Config,
+	mut config: crate::Config,
 	spiffe: Option<Arc<crate::control::spiffe::SpiffeClient>>,
 ) -> TestBind {
+	// Mock backends listen on loopback.
+	config.backend.allow_dynamic_loopback = true;
 	agent_core::telemetry::testing::setup_test_logging();
 	crate::crypto::init();
 	let encoder = config.session_encoder.clone();
 	let histogram_mode = config.histograms;
 	let stores = Stores::new(config.ipv6_enabled, config.threading_mode);
-	let client = client::Client::new(&config.dns, None, Default::default(), None);
+	let client = client::Client::new(&config.dns, None, config.backend.clone(), None);
 	let (drain_tx, drain_rx) = drain::new();
 	let pi = Arc::new(ProxyInputs {
 		cfg: Arc::new(config),
@@ -1460,6 +1521,7 @@ pub fn setup_proxy_test_with_config_and_spiffe(
 		)),
 		model_catalog: catalog::ModelCatalog::empty(),
 		admin: None,
+		stats: None,
 		upstream: client.clone(),
 		ca: None,
 		spiffe,
@@ -1477,11 +1539,11 @@ pub fn setup_proxy_test_with_config_and_spiffe(
 	}
 }
 
-pub async fn read_body_raw(body: axum_core::body::Body) -> Bytes {
-	to_bytes(body, 2_097_152).await.unwrap()
+pub async fn read_body_raw(body: impl Into<crate::http::Body>) -> Bytes {
+	body.into().into_bytes(2_097_152).await.unwrap()
 }
 
-pub async fn read_body(body: axum_core::body::Body) -> RequestDump {
+pub async fn read_body(body: impl Into<crate::http::Body>) -> RequestDump {
 	let b = read_body_raw(body).await;
 	serde_json::from_slice(&b).unwrap()
 }

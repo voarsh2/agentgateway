@@ -1,22 +1,18 @@
 use std::borrow::Cow;
-use std::fmt::{Debug, Display};
-use std::net::SocketAddr;
-use std::pin::Pin;
+use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, ready};
 use std::time::{Duration, Instant, SystemTime};
 
 use agent_core::metrics::CustomField;
 use agent_core::strng::{RichStrng, Strng};
 use agent_core::telemetry::{
-	OptionExt, OtelLogSink, ValueBag, current_connection_id, current_request_id, debug, display,
-	quoted,
+	OptionExt, ValueBag, current_connection_id, current_request_id, debug, display, quoted,
 };
 use agent_core::{Timestamp, strng};
-use bytes::Buf;
+use bytes::{Buf, Bytes};
 use crossbeam::atomic::AtomicCell;
 use frozen_collections::FzHashSet;
-use http_body::{Body, Frame, SizeHint};
+use http_body::Frame;
 use indexmap::IndexMap;
 use itertools::Itertools;
 use opentelemetry::logs::{AnyValue, LogRecord as _, Logger, LoggerProvider as _, Severity};
@@ -37,13 +33,14 @@ use crate::cel::{ContextBuilder, Expression, LLMContext};
 use crate::http::substrate::ateattr;
 use crate::http::substrate::ateattr::{ResumeDisposition, RouteOutcome};
 use crate::http::{Request, health};
-use crate::llm::InputFormat;
 use crate::llm::catalog::{CostLookupStatus, ModelCatalog};
+use crate::llm::{DetectedOperation, InputFormat};
 use crate::mcp::{MCPInfo, MCPOperation};
 use crate::proxy::{ProxyResponseReason, dtrace};
 use crate::telemetry::metrics::{
-	CostCatalogLookupLabels, GenAILabels, GenAILabelsTokenUsage, HTTPLabels, MCPCall, Metrics,
-	OutboundCallLabels, RouteIdentifier, SubstrateRouteLabels,
+	CostCatalogLookupLabels, ErrorTypeLabel, GenAIErrorType, GenAILabels, GenAILabelsTokenUsage,
+	GenAIRequestDurationLabels, HTTPLabels, MCPCall, Metrics, OutboundCallKind, OutboundCallLabels,
+	RouteIdentifier, SubstrateRouteLabels,
 };
 use crate::telemetry::trc::TraceParent;
 use crate::telemetry::{log_store, semconv, trc};
@@ -142,7 +139,7 @@ impl<'a> HttpSemconvAttributes<'a> {
 	}
 }
 
-fn database_llm_payload(
+pub(super) fn database_llm_payload(
 	mode: Option<crate::types::frontend::DatabaseLlmMode>,
 	input_messages: Option<&[agent_llm::types::NormalizedMessage]>,
 	info: Option<&LLMContext>,
@@ -379,8 +376,11 @@ impl<T: Debug> Debug for AsyncLog<T> {
 	}
 }
 
-/// Per-request accumulator of prompt-guard guardrail interventions.
+/// Per-request accumulator of prompt-guard guardrail evaluations.
 pub type GuardrailLog = AsyncLog<Vec<cel::GuardrailInfo>>;
+
+/// Per-request accumulator of mcpGuardrails dynamic metadata.
+pub type McpGuardrailsLog = AsyncLog<mcp::guardrails::McpGuardrailsDynamicMetadata>;
 
 #[derive(serde::Serialize, Debug, Default, Clone)]
 pub struct MetricsConfig {
@@ -396,13 +396,16 @@ pub struct Config {
 	pub fields: LoggingFields,
 	/// Compiled standard attributes, replaced on config reload and snapshotted per request.
 	#[serde(skip)]
-	pub database_fields: Arc<arc_swap::ArcSwap<LoggingFields>>,
+	pub standard_attributes: Arc<arc_swap::ArcSwap<LoggingFields>>,
+	/// Compiled `standardAttributes.session`, replaced on config reload.
+	#[serde(skip)]
+	pub session: Arc<arc_swap::ArcSwapOption<cel::Expression>>,
 	/// Level sets the level for logs
 	pub level: String,
 	/// Format sets the logging format (text or json)
 	pub format: crate::LoggingFormat,
 	/// Optional request log database sink.
-	pub database: Option<crate::telemetry::log_store::Config>,
+	pub database: Option<crate::database::DatabaseConfig>,
 }
 
 #[derive(serde::Serialize, Default, Clone, Debug)]
@@ -522,21 +525,6 @@ fn json_value_to_value_bag(v: &Value) -> ValueBag<'_> {
 	}
 }
 
-fn original_model_from_metadata<'a>(
-	req: Option<&'a cel::RequestSnapshot>,
-	resp: Option<&'a cel::ResponseSnapshot>,
-) -> Option<&'a str> {
-	resp
-		.and_then(|snapshot| snapshot.metadata.as_ref())
-		.and_then(|metadata| metadata.0.get("agentgateway_user_model"))
-		.or_else(|| {
-			req
-				.and_then(|snapshot| snapshot.metadata.as_ref())
-				.and_then(|metadata| metadata.0.get("agentgateway_user_model"))
-		})
-		.and_then(Value::as_str)
-}
-
 /// The incoming trace context picks which setting applies: `random_sampling` when the request has
 /// no trace, `client_sampling` when it has one that is sampled, `parent_not_sampled` when it has
 /// one that is not.
@@ -584,6 +572,7 @@ pub struct CelLogging {
 	pub fields: LoggingFields,
 	pub otlp_filter: Option<Arc<cel::Expression>>,
 	pub otlp_fields: LoggingFields,
+	pub standard_attributes: LoggingFields,
 	pub database_fields: LoggingFields,
 	pub metric_fields: MetricFields,
 }
@@ -594,6 +583,7 @@ pub struct CelLoggingExecutor<'a> {
 	pub fields: &'a LoggingFields,
 	pub otlp_filter: &'a Option<Arc<cel::Expression>>,
 	pub otlp_fields: &'a LoggingFields,
+	pub standard_attributes: &'a LoggingFields,
 	pub database_fields: &'a LoggingFields,
 	pub metric_fields: &'a MetricFields,
 }
@@ -717,6 +707,10 @@ impl<'a> CelLoggingExecutor<'a> {
 		self.eval(&self.otlp_fields.add)
 	}
 
+	fn eval_standard_attributes(&self) -> Vec<(Cow<str>, Option<Value>)> {
+		self.eval(&self.standard_attributes.add)
+	}
+
 	fn eval_database_additions(&self) -> Vec<(Cow<str>, Option<Value>)> {
 		self.eval(&self.database_fields.add)
 	}
@@ -724,11 +718,7 @@ impl<'a> CelLoggingExecutor<'a> {
 
 impl CelLogging {
 	pub fn new(cfg: Config, metrics: MetricsConfig) -> Self {
-		let database_fields = if cfg.database.is_some() {
-			cfg.database_fields.load().as_ref().clone()
-		} else {
-			LoggingFields::default()
-		};
+		let standard_attributes = cfg.standard_attributes.load().as_ref().clone();
 		let mut cel_context = cel::ContextBuilder::new();
 		if let Some(f) = &cfg.filter {
 			cel_context.register_log_expression(f.as_ref());
@@ -736,7 +726,7 @@ impl CelLogging {
 		for v in cfg.fields.add.values_unordered() {
 			cel_context.register_log_expression(v.as_ref());
 		}
-		for v in database_fields.add.values_unordered() {
+		for v in standard_attributes.add.values_unordered() {
 			cel_context.register_log_expression(v.as_ref());
 		}
 		for v in metrics.metric_fields.add.values_unordered() {
@@ -752,7 +742,8 @@ impl CelLogging {
 			fields: cfg.fields,
 			otlp_filter: None,
 			otlp_fields: LoggingFields::default(),
-			database_fields,
+			standard_attributes,
+			database_fields: LoggingFields::default(),
 			metric_fields: metrics.metric_fields,
 		}
 	}
@@ -774,10 +765,11 @@ impl CelLogging {
 			fields,
 			otlp_filter,
 			otlp_fields,
+			standard_attributes,
 			database_fields,
 			metric_fields,
 		} = self;
-		let executor = if inputs.req.is_none() && inputs.source_context.is_some() {
+		let mut executor = if inputs.req.is_none() && inputs.source_context.is_some() {
 			// TCP case: use new_tcp_logger
 			cel::Executor::new_tcp_logger(inputs.source_context, inputs.end_time)
 		} else {
@@ -792,12 +784,17 @@ impl CelLogging {
 				inputs.proxy,
 			)
 		};
+		executor.upstream_calls = inputs.upstream_calls;
+		if let Some(md) = inputs.mcp_guardrails {
+			executor.mcp_guardrails = cel::ExtensionOrDirect::Direct(Some(md));
+		}
 		CelLoggingExecutor {
 			executor,
 			filter,
 			fields,
 			otlp_filter,
 			otlp_fields,
+			standard_attributes,
 			database_fields,
 			metric_fields,
 		}
@@ -810,9 +807,11 @@ pub struct CelLoggingBuildInputs<'a> {
 	pub llm_response: Option<&'a LLMContext>,
 	pub mcp: Option<&'a MCPInfo>,
 	pub guardrails: Option<&'a Vec<cel::GuardrailInfo>>,
+	pub mcp_guardrails: Option<&'a mcp::guardrails::McpGuardrailsDynamicMetadata>,
 	pub end_time: &'a cel::RequestTime,
 	pub proxy: Option<&'a cel::ProxyContext>,
 	pub source_context: Option<&'a cel::SourceContext>,
+	pub upstream_calls: Option<&'a Vec<crate::telemetry::upstream::UpstreamCall>>,
 }
 
 #[derive(Debug)]
@@ -822,12 +821,6 @@ pub struct DropOnLog {
 }
 
 impl DropOnLog {
-	pub fn mark_provider_failed(&mut self) {
-		if let Some(log) = self.log.as_ref() {
-			log.attempt_provider_failed.store(Some(true));
-		}
-	}
-
 	pub fn as_mut(&mut self) -> Option<&mut RequestLog> {
 		self.log.as_mut()
 	}
@@ -842,8 +835,8 @@ impl DropOnLog {
 
 	/// Computes (health, eviction_duration, restore_health) for finish_request.
 	/// `unhealthy` should already be evaluated (preferably with the shared CEL executor when available).
-	/// When no CEL expression is set, the default treats 5xx, connection failures, or non-zero
-	/// gRPC status as unhealthy.
+	/// When no CEL expression is set, the default treats 5xx, connection failures, or server-side
+	/// gRPC failures as unhealthy.
 	#[cfg(test)]
 	fn default_unhealthy(log: &RequestLog) -> bool {
 		Self::default_unhealthy_for_status(log, log.status)
@@ -854,7 +847,18 @@ impl DropOnLog {
 		status: Option<crate::http::StatusCode>,
 	) -> bool {
 		status.is_none_or(|s| s.is_server_error())
-			|| log.grpc_status.load().is_some_and(|status| status != 0)
+			|| log.grpc_status.load().is_some_and(|status| {
+				// Only codes indicating a backend failure; client-induced codes (INVALID_ARGUMENT,
+				// NOT_FOUND, UNIMPLEMENTED, etc.) must not degrade backend health.
+				matches!(
+					tonic::Code::from(status as i32),
+					tonic::Code::Unknown
+						| tonic::Code::DeadlineExceeded
+						| tonic::Code::Internal
+						| tonic::Code::Unavailable
+						| tonic::Code::DataLoss
+				)
+			})
 	}
 
 	fn eviction_unhealthy(
@@ -862,11 +866,6 @@ impl DropOnLog {
 		status: Option<crate::http::StatusCode>,
 		cel_exec: &CelLoggingExecutor<'_>,
 	) -> bool {
-		// A provider can return successful HTTP headers and fail later while the body is
-		// being consumed, or report an LLM-level failure in a 200 stream.
-		if log.attempt_provider_failed.load().unwrap_or(false) {
-			return true;
-		}
 		let default_unhealthy = Self::default_unhealthy_for_status(log, status);
 		let Some(policy) = &log.health_policy else {
 			return default_unhealthy;
@@ -908,15 +907,44 @@ impl DropOnLog {
 		llm_response: Option<&LLMContext>,
 		custom_metric_fields: &CustomField,
 	) {
+		let request = log.llm_request.as_ref();
+		let Some(provider) = llm_response
+			.map(|response| response.provider.clone())
+			.or_else(|| request.map(|request| request.provider.clone()))
+		else {
+			return;
+		};
+		let request_model = llm_response
+			.map(|response| response.request_model.clone())
+			.or_else(|| request.map(|request| request.request_model.clone()));
+		let gen_ai_labels = Arc::new(GenAILabels {
+			gen_ai_operation_name: request
+				.map(|request| gen_ai_operation_name(request.input_format))
+				.map(RichStrng::from)
+				.into(),
+			gen_ai_system: provider.into(),
+			gen_ai_request_model: request_model.into(),
+			gen_ai_response_model: llm_response
+				.and_then(|response| response.response_model.clone())
+				.into(),
+			custom: custom_metric_fields.clone(),
+			route: route_identifier.clone(),
+		});
+
+		log
+			.metrics
+			.gen_ai_request_duration
+			.get_or_create(&GenAIRequestDurationLabels {
+				common: gen_ai_labels.clone().into(),
+				error: gen_ai_operation_failed(log)
+					.then_some(ErrorTypeLabel {
+						error_type: GenAIErrorType::Other,
+					})
+					.into(),
+			})
+			.observe(duration.as_secs_f64());
+
 		if let Some(llm_response) = llm_response {
-			let gen_ai_labels = Arc::new(GenAILabels {
-				gen_ai_operation_name: strng::literal!("chat").into(),
-				gen_ai_system: llm_response.provider.clone().into(),
-				gen_ai_request_model: llm_response.request_model.clone().into(),
-				gen_ai_response_model: llm_response.response_model.clone().into(),
-				custom: custom_metric_fields.clone(),
-				route: route_identifier.clone(),
-			});
 			if let Some(status) = llm_response.cost_status {
 				log
 					.metrics
@@ -996,11 +1024,6 @@ impl DropOnLog {
 					})
 					.observe(cwt as f64)
 			}
-			log
-				.metrics
-				.gen_ai_request_duration
-				.get_or_create(&gen_ai_labels)
-				.observe(duration.as_secs_f64());
 			if let Some(ttft) = llm_response
 				.time_to_first_token
 				.and_then(|duration| duration.0.to_std().ok())
@@ -1097,6 +1120,7 @@ impl RequestLog {
 		tcp_info: TCPConnectionInfo,
 	) -> Self {
 		RequestLog {
+			upstream_calls: Default::default(),
 			cel,
 			access_log_preset: None,
 			database_llm: Default::default(),
@@ -1143,9 +1167,10 @@ impl RequestLog {
 			outgoing_span: None,
 			llm_request: None,
 			llm_response: Default::default(),
-			attempt_provider_failed: Default::default(),
+			original_model: None,
 			guardrails: Default::default(),
-			budgets: None,
+			mcp_guardrails: Default::default(),
+			budgets: Vec::new(),
 			a2a_method: None,
 			a2a_response: None,
 			inference_pool: None,
@@ -1165,13 +1190,21 @@ impl RequestLog {
 
 	pub fn span_writer(&self) -> SpanWriter {
 		let inner = self.span_writer_inner().map(Arc::new);
-		SpanWriter { inner }
+		let upstream_calls = self
+			.cel
+			.cel_context
+			.needs_upstream_calls()
+			.then(|| self.upstream_calls.get_or_init(Default::default).clone());
+		SpanWriter {
+			inner,
+			upstream_calls,
+		}
 	}
 	pub fn insert_span_writer(&self, extensions: &mut ::http::Extensions) {
-		if let Some(inner) = self.span_writer_inner() {
-			extensions.insert(SpanWriter {
-				inner: Some(Arc::new(inner)),
-			});
+		// Inserted without tracing too, since it carries the `upstreamCalls` recorder.
+		let writer = self.span_writer();
+		if writer.is_enabled() || writer.upstream_calls.is_some() {
+			extensions.insert(writer);
 		}
 	}
 	fn span_writer_inner(&self) -> Option<SpanWriterInner> {
@@ -1240,8 +1273,10 @@ impl RequestLog {
 			llm_response,
 			mcp: mcp.filter(|m| !m.is_empty()),
 			guardrails: None,
+			mcp_guardrails: None,
 			end_time: &cel_end_time,
 			source_context: self.source_context.as_ref(),
+			upstream_calls: None,
 			proxy: Some(&proxy_timing),
 		});
 		let Some(rh) = self.request_handle.take() else {
@@ -1253,6 +1288,7 @@ impl RequestLog {
 
 #[derive(Debug)]
 pub struct RequestLog {
+	pub upstream_calls: std::sync::OnceLock<crate::telemetry::upstream::UpstreamCalls>,
 	pub cel: CelLogging,
 	pub access_log_preset: Option<crate::types::frontend::AccessLogPreset>,
 	/// Controls whether normalized LLM prompt/completion content is persisted in the database's
@@ -1322,15 +1358,15 @@ pub struct RequestLog {
 
 	pub llm_request: Option<llm::LLMRequest>,
 	pub llm_response: AsyncLog<llm::LLMInfo>,
-	/// Marker for the currently active upstream attempt. Reset before each retry attempt.
-	pub attempt_provider_failed: AsyncLog<bool>,
+	pub original_model: Option<String>,
 	pub guardrails: GuardrailLog,
-	pub budgets: Option<crate::http::budget::BudgetSettlement>,
+	pub mcp_guardrails: McpGuardrailsLog,
+	pub budgets: Vec<crate::http::budget::BudgetSettlement>,
 
 	pub a2a_method: Option<Strng>,
 	pub a2a_response: Option<a2a::ResponseInfo>,
 
-	pub inference_pool: Option<SocketAddr>,
+	pub inference_pool: Option<Target>,
 
 	pub ate_actor_name: Option<String>,
 	pub ate_actor_uid: Option<String>,
@@ -1350,6 +1386,73 @@ pub struct RequestLog {
 
 fn request_log_level(error: Option<&str>) -> &'static str {
 	if error.is_some() { "error" } else { "info" }
+}
+
+fn gen_ai_operation_failed(request: &RequestLog) -> bool {
+	// A provider 4xx (such as rate limiting) fails the GenAI operation even though
+	// an inbound HTTP server span does not classify client errors as server failures.
+	request.error.is_some()
+		|| request.status.is_some_and(|status| {
+			status.is_server_error()
+				|| (status.is_client_error() && request.reason == Some(ProxyResponseReason::Upstream))
+		})
+}
+
+fn mcp_outcome(request: &RequestLog, mcp: &MCPInfo) -> super::metrics::MCPOutcome {
+	use super::metrics::MCPOutcome;
+
+	if request.error.is_some()
+		|| request
+			.status
+			.is_some_and(|status| status.is_client_error() || status.is_server_error())
+	{
+		return MCPOutcome::gateway_error;
+	}
+	if mcp.error.is_some() {
+		return MCPOutcome::protocol_error;
+	}
+	if mcp.method_name.as_deref() == Some("tools/call") {
+		return match mcp.tool.as_ref().and_then(|tool| tool.result.as_ref()) {
+			Some(result) if result.get("isError").and_then(serde_json::Value::as_bool) == Some(true) => {
+				MCPOutcome::tool_error
+			},
+			Some(_) => MCPOutcome::success,
+			None => MCPOutcome::unknown,
+		};
+	}
+	if request.status.is_some_and(|status| status.is_success()) {
+		MCPOutcome::success
+	} else {
+		MCPOutcome::unknown
+	}
+}
+
+fn gen_ai_operation_name(input_format: InputFormat) -> &'static str {
+	match input_format {
+		InputFormat::Completions | InputFormat::Messages | InputFormat::Responses => "chat",
+		InputFormat::Gemini => "generate_content",
+		InputFormat::Embeddings => "embeddings",
+		// These operations have no standard GenAI operation name. Keep the custom values bounded.
+		InputFormat::Realtime => "realtime",
+		InputFormat::Rerank => "rerank",
+		InputFormat::Decisions | InputFormat::SystemOne => "decisions",
+		InputFormat::CountTokens | InputFormat::GeminiCountTokens => "count_tokens",
+		InputFormat::Detect(Some(operation)) => match operation {
+			DetectedOperation::Chat => "chat",
+			DetectedOperation::GenerateContent => "generate_content",
+			DetectedOperation::Embeddings => "embeddings",
+			DetectedOperation::CountTokens => "count_tokens",
+			DetectedOperation::Rerank => "rerank",
+			DetectedOperation::Decisions => "decisions",
+			DetectedOperation::Image => "image_generation",
+			DetectedOperation::Ocr => "ocr",
+			DetectedOperation::Compaction => "compaction",
+			DetectedOperation::Transcription => "transcription",
+			DetectedOperation::Speech => "speech",
+		},
+		// The path is not a known serving endpoint; do not assume it is chat.
+		InputFormat::Detect(None) => "unknown",
+	}
 }
 
 impl Drop for DropOnLog {
@@ -1418,16 +1521,19 @@ impl Drop for DropOnLog {
 			if let Some(llm_response) = llm_response.as_mut() {
 				llm_response.set_token_timing(log.start.as_instant(), end_time.as_instant());
 			}
-			if let (Some(budgets), Some(llm_response)) = (log.budgets.take(), llm_response.as_ref()) {
-				budgets.settle(llm_response);
+			if let Some(llm_response) = llm_response.as_ref() {
+				for budgets in std::mem::take(&mut log.budgets) {
+					budgets.settle(llm_response);
+				}
 			}
 
 			let mcp = log.mcp_status.take();
 			let guardrails = log.guardrails.take().filter(|g| !g.is_empty());
+			let mcp_guardrails = log.mcp_guardrails.take();
 			let request_handle = log.request_handle.take();
 			let cel_end_time = cel::RequestTime(end_time.as_datetime());
 			// The response snapshot is captured before the response body is drained, so
-			// trailer-only grpc-status values are learned later by LogBody. Copy the final
+			// Trailer-only grpc-status values are learned later by the body observer. Copy the final
 			// value back into the snapshot before evaluating access-log CEL fields.
 			if let Some(grpc_status) = log.grpc_status.load()
 				&& let Some(resp) = log.response_snapshot.as_mut()
@@ -1438,15 +1544,22 @@ impl Drop for DropOnLog {
 			if let Some(resp) = log.response_snapshot.as_mut() {
 				resp.proxy = Some(proxy_timing.clone());
 			}
+			let upstream_calls = log
+				.upstream_calls
+				.get()
+				.map(|calls| calls.take())
+				.unwrap_or_default();
 			let cel_exec = log.cel.build(CelLoggingBuildInputs {
 				req: log.request_snapshot.as_deref(),
 				resp: log.response_snapshot.as_ref(),
 				llm_response: llm_response.as_ref(),
 				mcp: mcp.as_ref().filter(|m| !m.is_empty()),
 				guardrails: guardrails.as_ref(),
+				mcp_guardrails: mcp_guardrails.as_ref(),
 				end_time: &cel_end_time,
 				proxy: Some(&proxy_timing),
 				source_context: log.source_context.as_ref(),
+				upstream_calls: Some(&upstream_calls),
 			});
 			if let Some(rh) = request_handle {
 				log.finish_request_handle(rh, end_time, &cel_exec);
@@ -1538,6 +1651,7 @@ impl Drop for DropOnLog {
 					.mcp_requests
 					.get_or_create(&MCPCall {
 						method: mcp.method_name.clone().map(RichStrng::from).into(),
+						outcome: mcp_outcome(&log, mcp),
 						resource_type: mcp.resource_type().into(),
 						server: mcp.target_name().map(RichStrng::from).into(),
 						resource: mcp.metric_resource_name().map(RichStrng::from).into(),
@@ -1558,11 +1672,16 @@ impl Drop for DropOnLog {
 			let otlp_log_enabled = log.otel_logger.is_some();
 			// For now we only enable this log for LLM requests to keep cost/performance appropriate.
 			let log_store_enabled = log_store::enabled()
-				&& (llm_response.is_some()
+				&& (log.llm_request.is_some()
+					|| llm_response.is_some()
 					|| log
 						.listener_name
 						.as_ref()
-						.is_some_and(|listener| listener.listener_name.as_str() == llm::LOCAL_LISTENER_NAME));
+						.is_some_and(|listener| listener.listener_name.as_str() == llm::LOCAL_LISTENER_NAME)
+					|| log
+						.route_name
+						.as_ref()
+						.is_some_and(|route| route.name.as_str() == llm::LOCAL_ROUTE_NAME));
 			if !maybe_enable_log && !enable_trace && !log_store_enabled && !otlp_log_enabled {
 				return;
 			}
@@ -1588,7 +1707,7 @@ impl Drop for DropOnLog {
 			let usage_cost_total = cost.map(|b| b.total().to_string());
 			let trace_cost_fields = if enable_trace {
 				cost.map(|b| {
-					[
+					let mut fields = vec![
 						("agw.ai.usage.cost.input", b.input.to_string()),
 						("agw.ai.usage.cost.output", b.output.to_string()),
 						("agw.ai.usage.cost.cache_read", b.cache_read.to_string()),
@@ -1596,7 +1715,25 @@ impl Drop for DropOnLog {
 						("agw.ai.usage.cost.reasoning", b.reasoning.to_string()),
 						("agw.ai.usage.cost.input_audio", b.input_audio.to_string()),
 						("agw.ai.usage.cost.output_audio", b.output_audio.to_string()),
-					]
+						("agw.ai.usage.cost.pages", b.pages.to_string()),
+						(
+							"agw.ai.usage.cost.audio_duration",
+							b.audio_duration.to_string(),
+						),
+					];
+					fields.extend(
+						[
+							("agw.ai.usage.cost.cache_write_details.1h", b.cache_write_1h),
+							(
+								"agw.ai.usage.cost.cache_write_details.12h",
+								b.cache_write_12h,
+							),
+						]
+						.into_iter()
+						.filter(|(_, v)| !v.is_zero())
+						.map(|(k, v)| (k, v.to_string())),
+					);
+					fields
 				})
 			} else {
 				None
@@ -1646,6 +1783,7 @@ impl Drop for DropOnLog {
 				.as_ref()
 				.map(|g| serde_json::Value::Array(g.iter().map(cel::GuardrailInfo::minimal).collect()));
 
+			let standard_raws = cel_exec.eval_standard_attributes();
 			let emit_ids = agent_core::telemetry::enabled("request", &Level::DEBUG);
 			let mut kv = vec![
 				(
@@ -1787,13 +1925,10 @@ impl Drop for DropOnLog {
 				// OpenTelemetry Gen AI Semantic Conventions v1.40.0
 				(
 					"gen_ai.operation.name",
-					log.llm_request.as_ref().map(|r| {
-						if r.input_format == InputFormat::Embeddings {
-							"embeddings".into()
-						} else {
-							"chat".into()
-						}
-					}),
+					log
+						.llm_request
+						.as_ref()
+						.map(|r| gen_ai_operation_name(r.input_format).into()),
 				),
 				(
 					"gen_ai.provider.name",
@@ -1808,6 +1943,10 @@ impl Drop for DropOnLog {
 					llm_response
 						.as_ref()
 						.and_then(|l| l.response_model.display()),
+				),
+				(
+					"agw.ai.original_model",
+					log.original_model.as_deref().map(Into::into),
 				),
 				("gen_ai.usage.input_tokens", input_tokens.map(Into::into)),
 				(
@@ -1873,6 +2012,14 @@ impl Drop for DropOnLog {
 					llm_response
 						.as_ref()
 						.and_then(|l| l.output_audio_tokens)
+						.map(Into::into),
+				),
+				// Not part of official semconv
+				(
+					"gen_ai.usage.audio_seconds",
+					llm_response
+						.as_ref()
+						.and_then(|l| l.audio_seconds)
 						.map(Into::into),
 				),
 				(
@@ -1949,11 +2096,17 @@ impl Drop for DropOnLog {
 				("duration", Some(dur.as_str().into())),
 			];
 
-			let mut extra_kv_capacity = trace_cost_fields.as_ref().map_or(0, |fields| fields.len());
+			let mut extra_kv_capacity =
+				standard_raws.len() + trace_cost_fields.as_ref().map_or(0, |fields| fields.len());
 			if maybe_enable_log || log_store_enabled {
 				extra_kv_capacity += fields.add.len();
 			}
 			kv.reserve_exact(extra_kv_capacity);
+			kv.extend(
+				standard_raws
+					.iter()
+					.map(|(k, v)| (k.as_ref(), v.as_ref().map(json_value_to_value_bag))),
+			);
 			let protocol_span_name = mcp
 				.as_ref()
 				.and_then(|mcp| mcp.method_name.clone())
@@ -2088,22 +2241,17 @@ impl Drop for DropOnLog {
 				}
 
 				if log_store_enabled {
-					let original_model = original_model_from_metadata(
-						log.request_snapshot.as_deref(),
-						log.response_snapshot.as_ref(),
-					)
-					.map(str::to_owned);
-
 					let mut db_kv = kv.clone();
+					for (k, v) in &mut db_kv {
+						if cel_exec.database_fields.has(k) {
+							*v = None;
+						}
+					}
 					let db_raws = cel_exec.eval_database_additions();
 					let default_db_raws = [
 						(
 							Cow::Borrowed("user_agent.name"),
 							user_agent_name(log.request_snapshot.as_deref()).map(Value::String),
-						),
-						(
-							Cow::Borrowed("agw.ai.original_model"),
-							original_model.clone().map(Value::String),
 						),
 						(
 							Cow::Borrowed("agw.api_key.name"),
@@ -2126,26 +2274,34 @@ impl Drop for DropOnLog {
 							("agw.ai.usage.cost.reasoning", cost.reasoning),
 							("agw.ai.usage.cost.inputAudio", cost.input_audio),
 							("agw.ai.usage.cost.outputAudio", cost.output_audio),
+							("agw.ai.usage.cost.pages", cost.pages),
+							("agw.ai.usage.cost.audioDuration", cost.audio_duration),
 						];
-						db_kv.reserve(cost_raws.len());
-						for (k, v) in &cost_raws {
+						let cache_write_details = [
+							(
+								"agw.ai.usage.cost.cacheWriteDetails.1h",
+								cost.cache_write_1h,
+							),
+							(
+								"agw.ai.usage.cost.cacheWriteDetails.12h",
+								cost.cache_write_12h,
+							),
+						]
+						.into_iter()
+						.filter(|(_, v)| !v.is_zero());
+						db_kv.reserve(cost_raws.len() + 2);
+						for (k, v) in cost_raws.into_iter().chain(cache_write_details) {
 							let eval = v.to_f64().map(ValueBag::from_f64);
-							db_kv.push((*k, eval));
+							db_kv.push((k, eval));
 						}
 					}
 					let attributes = database_attributes(&db_kv);
-					let payload = database_llm_payload(
-						log.database_llm,
-						log.input_messages.as_deref().map(Vec::as_slice),
-						llm_response.as_ref(),
-					);
-					let has_payload = payload.is_some();
 					let total_tokens = llm_response.as_ref().and_then(|llm| {
 						llm
 							.total_tokens
 							.or_else(|| Some(llm.input_tokens?.saturating_add(llm.output_tokens?)))
 					});
-					log_store::emit(log_store::StoredRequestLog {
+					let record = log_store::StoredRequestLog {
 						id: uuid::Uuid::now_v7().to_string(),
 						started_at: log.start.as_datetime().with_timezone(&chrono::Utc),
 						completed_at: end_time.as_datetime().with_timezone(&chrono::Utc),
@@ -2154,13 +2310,10 @@ impl Drop for DropOnLog {
 						span_id: span_id.map(|id| id.to_string()),
 						http_status: log.status.as_ref().map(|s| i64::from(s.as_u16())),
 						error: log.error.clone(),
-						gen_ai_operation_name: log.llm_request.as_ref().map(|request| {
-							if request.input_format == InputFormat::Embeddings {
-								"embeddings".to_string()
-							} else {
-								"chat".to_string()
-							}
-						}),
+						gen_ai_operation_name: log
+							.llm_request
+							.as_ref()
+							.map(|request| gen_ai_operation_name(request.input_format).to_string()),
 						gen_ai_provider_name: log
 							.llm_request
 							.as_ref()
@@ -2175,13 +2328,34 @@ impl Drop for DropOnLog {
 						input_tokens: u64_to_i64(input_tokens),
 						output_tokens: u64_to_i64(llm_response.as_ref().and_then(|llm| llm.output_tokens)),
 						total_tokens: u64_to_i64(total_tokens),
+						cache_read_input_tokens: u64_to_i64(
+							llm_response
+								.as_ref()
+								.and_then(|llm| llm.cached_input_tokens),
+						),
+						cache_creation_input_tokens: u64_to_i64(
+							llm_response
+								.as_ref()
+								.and_then(|llm| llm.cache_creation_input_tokens),
+						),
+						reasoning_tokens: u64_to_i64(
+							llm_response.as_ref().and_then(|llm| llm.reasoning_tokens),
+						),
+						time_to_first_token_ms: time_to_first_token.map(|seconds| seconds * 1000.0),
+						time_per_output_token_ms: time_per_output_token.map(|seconds| seconds * 1000.0),
 						cost: cost.and_then(|cost| cost.total().to_f64()),
 						agentgateway_user: attributes.agentgateway_user,
 						agentgateway_group: attributes.agentgateway_group,
 						user_agent_name: attributes.user_agent_name,
-						has_payload,
+						has_payload: false,
 						attributes_json: attributes.json,
-						payload,
+						payload: None,
+					};
+					log_store::emit(log_store::PendingRequestLog {
+						record,
+						llm_mode: log.database_llm,
+						input_messages: log.input_messages.take(),
+						llm_response,
 					});
 				}
 			}
@@ -2189,74 +2363,26 @@ impl Drop for DropOnLog {
 	}
 }
 
-pin_project_lite::pin_project! {
-		/// A data stream created from a [`Body`].
-		#[derive(Debug)]
-		pub struct LogBody<B> {
-				#[pin]
-				body: B,
-				log: DropOnLog,
-		}
-}
-
-impl<B> LogBody<B> {
-	/// Create a new `LogBody`
-	pub fn new(body: B, log: DropOnLog) -> Self {
-		Self { body, log }
-	}
-}
-
-impl<B: Body + Debug> Body for LogBody<B>
-where
-	B::Data: Debug,
-	B::Error: Display,
-{
-	type Data = B::Data;
-	type Error = B::Error;
-
-	fn poll_frame(
-		self: Pin<&mut Self>,
-		cx: &mut Context<'_>,
-	) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-		let this = self.project();
-		let result = ready!(this.body.poll_frame(cx));
-		match result {
-			Some(Ok(frame)) => {
-				if let Some(trailer) = frame.trailers_ref()
-					&& let Some(grpc) = this.log.as_mut().map(|log| log.grpc_status.clone())
-				{
-					crate::proxy::httpproxy::maybe_set_grpc_status(&grpc, trailer);
-				}
-				if let Some(log) = this.log.as_mut()
-					&& let Some(data) = frame.data_ref()
-				{
-					// Count the bytes in this data frame
-					log.response_bytes = log.response_bytes.saturating_add(data.remaining() as u64);
-				}
-				Poll::Ready(Some(Ok(frame)))
-			},
-			Some(Err(e)) => {
-				this.log.mark_provider_failed();
-				// The head is long gone by the time the body fails, so nothing else records this:
-				// without it a stream torn down mid-flight is logged as whatever status we already
-				// sent, indistinguishable from one the client read to completion.
-				if let Some(log) = this.log.as_mut()
-					&& log.error.is_none()
-				{
-					log.error = Some(format!("response body failed: {e}"));
-				}
-				Poll::Ready(Some(Err(e)))
-			},
-			None => Poll::Ready(None),
+impl agent_http::BodyObserver for DropOnLog {
+	fn on_error(&mut self, error: &crate::http::Error) {
+		// Response headers have already been sent; retain the body failure in the log.
+		if let Some(log) = self.as_mut()
+			&& log.error.is_none()
+		{
+			log.error = Some(format!("response body failed: {error}"));
 		}
 	}
-
-	fn is_end_stream(&self) -> bool {
-		self.body.is_end_stream()
-	}
-
-	fn size_hint(&self) -> SizeHint {
-		self.body.size_hint()
+	fn on_frame(&mut self, frame: &Frame<Bytes>) {
+		if let Some(trailer) = frame.trailers_ref()
+			&& let Some(grpc) = self.as_mut().map(|log| log.grpc_status.clone())
+		{
+			crate::proxy::httpproxy::maybe_set_grpc_status(&grpc, trailer);
+		}
+		if let Some(log) = self.as_mut()
+			&& let Some(data) = frame.data_ref()
+		{
+			log.response_bytes = log.response_bytes.saturating_add(data.remaining() as u64);
+		}
 	}
 }
 
@@ -2447,20 +2573,21 @@ impl OtelAccessLogger {
 				.build()
 		};
 
-		let logger = provider.logger("agentgateway.access");
+		Ok(Self::from_provider(provider))
+	}
 
-		Ok(Self {
+	fn from_provider(provider: SdkLoggerProvider) -> Self {
+		let logger = provider.logger("agentgateway.access");
+		Self {
 			inner: super::NonBlockingDrop::new(OtelAccessLoggerInner { provider, logger }),
-		})
+		}
 	}
 
 	pub fn shutdown(&self) {
 		let _ = self.inner.provider.shutdown();
 	}
-}
 
-impl OtelLogSink for OtelAccessLogger {
-	fn emit<'v>(&self, level: &str, target: &str, kv: &[(&str, Option<ValueBag<'v>>)]) {
+	fn emit<'v>(&self, level: &str, _target: &str, kv: &[(&str, Option<ValueBag<'v>>)]) {
 		let severity = match level {
 			"error" => Severity::Error,
 			"warn" => Severity::Warn,
@@ -2481,10 +2608,12 @@ impl OtelLogSink for OtelAccessLogger {
 		let mut record = self.inner.logger.create_log_record();
 		record.set_severity_number(severity);
 		record.set_severity_text(severity_text);
-		record.set_target(target.to_string());
 
 		let mut trace_id_val: Option<u128> = None;
 		let mut span_id_val: Option<u64> = None;
+		let mut method = None;
+		let mut path = None;
+		let mut status = None;
 
 		for &(k, ref v) in kv {
 			let Some(v) = v else { continue };
@@ -2496,7 +2625,6 @@ impl OtelLogSink for OtelAccessLogger {
 					{
 						trace_id_val = Some(id);
 					}
-					record.add_attribute(Key::new(k.to_string()), to_any_value(v));
 				},
 				"span.id" => {
 					if let Some(s) = v.to_str()
@@ -2504,12 +2632,13 @@ impl OtelLogSink for OtelAccessLogger {
 					{
 						span_id_val = Some(id);
 					}
-					record.add_attribute(Key::new(k.to_string()), to_any_value(v));
 				},
-				_ => {
-					record.add_attribute(Key::new(k.to_string()), to_any_value(v));
-				},
+				"http.request.method" => method = Some(v),
+				"url.path" => path = Some(v),
+				"http.response.status_code" => status = Some(v),
+				_ => {},
 			}
+			record.add_attribute(Key::new(k.to_string()), to_any_value(v));
 		}
 
 		if let Some(tid) = trace_id_val {
@@ -2522,17 +2651,20 @@ impl OtelLogSink for OtelAccessLogger {
 			);
 		}
 
-		self.inner.logger.emit(record);
-	}
+		let body = [method, path, status].into_iter().flatten().join(" ");
+		if !body.is_empty() {
+			record.set_body(AnyValue::String(body.into()));
+		}
+		record.set_timestamp(std::time::SystemTime::now());
 
-	fn shutdown(&self) {
-		let _ = self.inner.provider.shutdown();
+		self.inner.logger.emit(record);
 	}
 }
 
 // SpanWriter is a construct that can start otel spans
 #[derive(Debug, Default, Clone)]
 pub struct SpanWriter {
+	pub(crate) upstream_calls: Option<crate::telemetry::upstream::UpstreamCalls>,
 	inner: Option<Arc<SpanWriterInner>>,
 }
 
@@ -2547,15 +2679,36 @@ impl SpanWriter {
 		self.inner.is_some()
 	}
 
-	pub fn start(&self, name: impl Into<Cow<'static, str>>) -> SpanWriteOnDrop {
-		match &self.inner {
-			Some(i) => i.start(name),
-			None => SpanWriteOnDrop::default(),
+	/// Marks an outbound request to be recorded in `upstreamCalls` when it is sent.
+	pub(crate) fn record_outbound(
+		&self,
+		extensions: &mut ::http::Extensions,
+		labels: OutboundCallLabels,
+	) {
+		// Mirrors run detached and can finish after the request is logged, so they aren't recorded.
+		if matches!(labels.kind, OutboundCallKind::Mirror) {
+			extensions.remove::<crate::telemetry::upstream::OutboundRequest>();
+			return;
+		}
+		if let Some(calls) = &self.upstream_calls {
+			extensions.insert(crate::telemetry::upstream::OutboundRequest {
+				calls: calls.clone(),
+				labels,
+			});
 		}
 	}
 
+	pub fn start(&self, name: impl Into<Cow<'static, str>>) -> SpanWriteOnDrop {
+		let mut span = match &self.inner {
+			Some(i) => i.start(name),
+			None => SpanWriteOnDrop::default(),
+		};
+		span.upstream_calls = self.upstream_calls.clone();
+		span
+	}
+
 	pub fn start_outbound(&self, labels: OutboundCallLabels) -> SpanWriteOnDrop {
-		match &self.inner {
+		let mut span = match &self.inner {
 			Some(i) => i.start_with_details(
 				labels.subtype.as_str(),
 				SpanKind::Client,
@@ -2565,7 +2718,9 @@ impl SpanWriter {
 				],
 			),
 			None => SpanWriteOnDrop::default(),
-		}
+		};
+		span.upstream_calls = self.upstream_calls.clone();
+		span
 	}
 }
 
@@ -2590,6 +2745,7 @@ impl SpanWriterInner {
 		let child = self.parent.new_span();
 
 		SpanWriteOnDrop {
+			upstream_calls: None,
 			name: Some(name.into()),
 			span_kind,
 			start_time: Some(SystemTime::now()),
@@ -2603,6 +2759,7 @@ impl SpanWriterInner {
 }
 
 pub struct SpanWriteOnDrop {
+	upstream_calls: Option<crate::telemetry::upstream::UpstreamCalls>,
 	name: Option<Cow<'static, str>>,
 	span_kind: SpanKind,
 	start_time: Option<SystemTime>,
@@ -2615,6 +2772,7 @@ pub struct SpanWriteOnDrop {
 impl Default for SpanWriteOnDrop {
 	fn default() -> Self {
 		Self {
+			upstream_calls: None,
 			name: None,
 			span_kind: SpanKind::Internal,
 			start_time: None,
@@ -2634,7 +2792,10 @@ impl SpanWriteOnDrop {
 				inner: self.inner.clone(),
 			})
 		});
-		SpanWriter { inner }
+		SpanWriter {
+			inner,
+			upstream_calls: self.upstream_calls.clone(),
+		}
 	}
 
 	pub fn rename_span(&mut self, name: impl Into<Cow<'static, str>>) {
@@ -2764,9 +2925,11 @@ mod tests {
 	use std::sync::{Arc, Mutex};
 	use std::time::Instant;
 
+	use opentelemetry::InstrumentationScope;
 	use opentelemetry::trace::SpanKind;
 	use opentelemetry_sdk::error::OTelSdkResult;
 	use opentelemetry_sdk::trace::{SimpleSpanProcessor, SpanData, SpanExporter};
+	use prometheus_client::encoding::text::encode;
 	use prometheus_client::registry::Registry;
 
 	use super::*;
@@ -2776,6 +2939,73 @@ mod tests {
 	use crate::telemetry::trc;
 	use crate::transport::stream::TCPConnectionInfo;
 	use crate::types::frontend::{DatabaseLlmMode, LoggingPolicy};
+
+	#[derive(Clone, Debug, Default)]
+	struct RecordingLogExporter {
+		records: Arc<Mutex<Vec<(opentelemetry_sdk::logs::SdkLogRecord, InstrumentationScope)>>>,
+	}
+
+	impl opentelemetry_sdk::logs::LogExporter for RecordingLogExporter {
+		fn export(
+			&self,
+			batch: opentelemetry_sdk::logs::LogBatch<'_>,
+		) -> impl std::future::Future<Output = OTelSdkResult> + Send {
+			let mut records = self.records.lock().unwrap();
+			for (record, scope) in batch.iter() {
+				records.push((record.clone(), scope.clone()));
+			}
+			ready(Ok(()))
+		}
+	}
+
+	#[test]
+	fn otlp_access_log_scope_is_logger_name_not_tracing_target() {
+		let exporter = RecordingLogExporter::default();
+		let provider = SdkLoggerProvider::builder()
+			.with_simple_exporter(exporter.clone())
+			.build();
+		let logger = OtelAccessLogger::from_provider(provider);
+
+		let kv = [("http.request.method", Some(ValueBag::from("GET")))];
+		logger.emit("info", "request", &kv);
+		logger.inner.provider.force_flush().unwrap();
+
+		let records = exporter.records.lock().unwrap();
+		assert_eq!(records.len(), 1);
+		let (record, scope) = &records[0];
+		assert_eq!(scope.name(), "agentgateway.access");
+		// opentelemetry-proto uses a record target as the wire scope name when one is set.
+		assert!(record.target().is_none());
+	}
+
+	#[test]
+	fn otlp_access_log_carries_a_body_and_timestamp() {
+		let exporter = RecordingLogExporter::default();
+		let provider = SdkLoggerProvider::builder()
+			.with_simple_exporter(exporter.clone())
+			.build();
+		let logger = OtelAccessLogger::from_provider(provider);
+
+		let kv = [
+			("http.request.method", Some(ValueBag::from("POST"))),
+			("url.path", Some(ValueBag::from("/v1/messages"))),
+			("http.response.status_code", Some(ValueBag::from(200_i64))),
+		];
+		logger.emit("info", "request", &kv);
+		logger.inner.provider.force_flush().unwrap();
+
+		let records = exporter.records.lock().unwrap();
+		let (record, _) = &records[0];
+		match record.body() {
+			Some(AnyValue::String(body)) => assert_eq!(body.as_ref(), "POST /v1/messages 200"),
+			other => panic!("unexpected body: {other:?}"),
+		}
+		assert!(
+			record
+				.timestamp()
+				.is_some_and(|t| t > std::time::SystemTime::UNIX_EPOCH)
+		);
+	}
 
 	#[derive(Clone, Debug, Default)]
 	struct RecordingSpanExporter {
@@ -2815,10 +3045,6 @@ mod tests {
 		)
 	}
 
-	fn test_request_log() -> RequestLog {
-		test_request_log_with_registry().0
-	}
-
 	fn test_request_log_with_registry() -> (RequestLog, Registry) {
 		let cel = CelLogging {
 			cel_context: crate::cel::ContextBuilder::new(),
@@ -2827,6 +3053,7 @@ mod tests {
 			otlp_filter: None,
 			otlp_fields: LoggingFields::default(),
 			metric_fields: MetricFields::default(),
+			standard_attributes: LoggingFields::default(),
 			database_fields: LoggingFields::default(),
 		};
 		let mut registry = Registry::default();
@@ -2848,6 +3075,58 @@ mod tests {
 			},
 		);
 		(log, registry)
+	}
+
+	fn test_request_log() -> RequestLog {
+		test_request_log_with_registry().0
+	}
+
+	fn metric_test_llm_request() -> llm::LLMRequest {
+		llm::LLMRequest {
+			input_tokens: None,
+			input_format: llm::InputFormat::Responses,
+			cache_convention: Default::default(),
+			request_model: "test-model".into(),
+			original_model: None,
+			provider: "test-provider".into(),
+			streaming: false,
+			params: Default::default(),
+			prompt: None,
+			provider_state: None,
+		}
+	}
+
+	fn encoded_metrics(registry: &Registry) -> String {
+		let mut encoded = String::new();
+		encode(&mut encoded, registry).unwrap();
+		encoded
+	}
+
+	#[test]
+	fn mcp_outcomes() {
+		use crate::telemetry::metrics::MCPOutcome::*;
+		let ok = Some(http::StatusCode::OK);
+		let bad = Some(http::StatusCode::BAD_GATEWAY);
+		for (status, is_error, rpc_error, expected) in [
+			(ok, Some(false), false, success),
+			(ok, Some(true), false, tool_error),
+			(ok, None, true, protocol_error),
+			(bad, Some(true), false, gateway_error),
+			(ok, None, false, unknown),
+		] {
+			let mut log = test_request_log();
+			log.status = status;
+			let mut mcp = MCPInfo {
+				method_name: Some("tools/call".into()),
+				..Default::default()
+			};
+			mcp.set_tool("server".into(), "echo".into());
+			mcp.tool.as_mut().unwrap().result = is_error.map(|e| serde_json::json!({"isError": e}));
+			if rpc_error {
+				mcp.capture_error(&rmcp::ErrorData::invalid_params("bad", None));
+			}
+			assert_eq!(mcp_outcome(&log, &mcp), expected);
+		}
 	}
 
 	#[test]
@@ -2955,6 +3234,7 @@ mod tests {
 			input_format: llm::InputFormat::Responses,
 			cache_convention: Default::default(),
 			request_model: "test-model".into(),
+			original_model: None,
 			provider: "test-provider".into(),
 			streaming: false,
 			params: Default::default(),
@@ -2967,6 +3247,363 @@ mod tests {
 		let mut context = LLMContext::from(request);
 		context.completion = Some(vec!["world".to_string()]);
 		context
+	}
+
+	#[test]
+	fn gen_ai_request_duration_records_success_and_failure_outcomes() {
+		for (status, error, reason, expected_error_type) in [
+			(http::StatusCode::OK, None, None, None),
+			(
+				http::StatusCode::BAD_REQUEST,
+				None,
+				Some(ProxyResponseReason::DirectResponse),
+				None,
+			),
+			(
+				http::StatusCode::TOO_MANY_REQUESTS,
+				None,
+				Some(ProxyResponseReason::DirectResponse),
+				None,
+			),
+			(http::StatusCode::TOO_MANY_REQUESTS, None, None, None),
+			(
+				http::StatusCode::BAD_REQUEST,
+				Some("invalid request"),
+				Some(ProxyResponseReason::InvalidRequest),
+				Some("_OTHER"),
+			),
+			(
+				http::StatusCode::TOO_MANY_REQUESTS,
+				None,
+				Some(ProxyResponseReason::Upstream),
+				Some("_OTHER"),
+			),
+			(
+				http::StatusCode::INTERNAL_SERVER_ERROR,
+				None,
+				Some(ProxyResponseReason::Upstream),
+				Some("_OTHER"),
+			),
+			(
+				http::StatusCode::BAD_GATEWAY,
+				Some("connection failed"),
+				Some(ProxyResponseReason::UpstreamFailure),
+				Some("_OTHER"),
+			),
+			(
+				http::StatusCode::INTERNAL_SERVER_ERROR,
+				Some("unclassified failure"),
+				None,
+				Some("_OTHER"),
+			),
+		] {
+			let (mut log, registry) = test_request_log_with_registry();
+			log.status = Some(status);
+			log.error = error.map(str::to_string);
+			log.reason = reason;
+			log.llm_request = Some(metric_test_llm_request());
+
+			drop(DropOnLog::from(log));
+
+			let encoded = encoded_metrics(&registry);
+			let count = encoded
+				.lines()
+				.find(|line| line.starts_with("gen_ai_server_request_duration_count"))
+				.unwrap_or_else(|| panic!("no GenAI request duration count in:\n{encoded}"));
+			match expected_error_type {
+				Some(expected) => assert!(
+					count.contains(&format!("error_type=\"{expected}\"")),
+					"expected error.type {expected} in: {count}"
+				),
+				None => assert!(
+					!count.contains("error_type="),
+					"successful request unexpectedly has error.type: {count}"
+				),
+			}
+		}
+	}
+
+	#[test]
+	fn grpc_refusal_by_the_proxy_logs_its_grpc_status() {
+		use crate::http::jwt::TokenError;
+		use crate::proxy::ProxyError;
+		use crate::proxy::httpproxy::{resolve_response, set_final_response_fields};
+
+		let refusal = || {
+			Err(ProxyError::JwtAuthenticationFailure(
+				TokenError::UnknownKeyId("rotated".into()),
+			))
+		};
+
+		let mut log = test_request_log();
+		let (mut response, reason) = resolve_response(refusal(), &mut log, true);
+		set_final_response_fields(&mut log, &reason, &mut response);
+		assert_eq!(response.status(), http::StatusCode::OK);
+		assert_eq!(
+			log.grpc_status.load(),
+			Some(tonic::Code::Unauthenticated as u8)
+		);
+
+		let mut log = test_request_log();
+		log.grpc_status.store(Some(tonic::Code::Internal as u8));
+		let (mut response, reason) = resolve_response(refusal(), &mut log, false);
+		set_final_response_fields(&mut log, &reason, &mut response);
+		assert_eq!(response.status(), http::StatusCode::UNAUTHORIZED);
+		assert_eq!(log.grpc_status.load(), None);
+	}
+
+	#[test]
+	fn mcp_authorization_denial_sets_internal_error_context() {
+		use crate::mcp;
+		use crate::proxy::ProxyError;
+		use crate::proxy::httpproxy::resolve_response;
+
+		let error = ProxyError::MCP(mcp::Error::Authorization(
+			rmcp::model::RequestId::Number(7),
+			"tool".to_string(),
+			"private-item".to_string(),
+		));
+		let mut log = test_request_log();
+		let (response, reason) = resolve_response(Err(error), &mut log, false);
+		let detail = "mcp: authorization denied for tool: private-item";
+		assert_eq!(reason, ProxyResponseReason::Authorization);
+		assert_eq!(log.reason, Some(ProxyResponseReason::Authorization));
+		assert_eq!(log.error.as_deref(), Some(detail));
+		let context = response
+			.extensions()
+			.get::<crate::cel::ProxyContext>()
+			.unwrap();
+		let error = context.error.as_ref().unwrap();
+		assert_eq!(error.reason, "Authorization");
+		assert_eq!(error.message, detail);
+	}
+
+	#[test]
+	fn gen_ai_duration_preserves_response_failures_and_snapshot_metadata() {
+		use crate::http::transformation_cel::TransformationMetadata;
+		use crate::proxy::ProxyError;
+		use crate::proxy::httpproxy::{resolve_response, set_final_response_fields};
+
+		for upstream_failed in [false, true] {
+			for policy in ["none", "error", "direct"] {
+				let (mut log, registry) = test_request_log_with_registry();
+				log.llm_request = Some(metric_test_llm_request());
+				log
+					.cel
+					.ctx()
+					.register_log_expression(&Expression::new_strict("proxy.error").unwrap());
+				let initial = if upstream_failed {
+					Err(ProxyError::NoHealthyEndpoints)
+				} else {
+					Ok(::http::Response::new(crate::http::Body::empty()))
+				};
+				let (mut response, mut reason) = resolve_response(initial, &mut log, false);
+				let original_reason = reason;
+				let metadata = TransformationMetadata(serde_json::Map::from_iter([(
+					"marker".to_string(),
+					serde_json::json!("retained"),
+				)]));
+				response.extensions_mut().insert(metadata.clone());
+				match policy {
+					"error" => {
+						(response, reason) = resolve_response(
+							Err(ProxyError::ProcessingString("policy failed".to_string())),
+							&mut log,
+							false,
+						);
+						response.extensions_mut().insert(metadata.clone());
+					},
+					"direct" => {
+						let mut replacement = ::http::Response::builder()
+							.status(http::StatusCode::TOO_MANY_REQUESTS)
+							.body(crate::http::Body::empty())
+							.unwrap();
+						replacement.extensions_mut().insert(metadata.clone());
+						(response, reason) = resolve_response(
+							Err(ProxyError::direct_response(replacement)),
+							&mut log,
+							false,
+						);
+					},
+					_ => {},
+				}
+				let expected_reason = match policy {
+					"error" => ProxyError::ProcessingString("policy failed".to_string()).as_reason(),
+					"direct" => ProxyResponseReason::DirectResponse,
+					_ => original_reason,
+				};
+				assert_eq!(reason, expected_reason);
+				let failed = upstream_failed || policy == "error";
+				assert_eq!(log.error.is_some(), failed);
+				if upstream_failed {
+					assert!(
+						log
+							.error
+							.as_ref()
+							.unwrap()
+							.contains(&ProxyError::NoHealthyEndpoints.to_string())
+					);
+				}
+				if policy == "error" {
+					assert!(log.error.as_ref().unwrap().contains("policy failed"));
+				}
+				// Resolution must leave extensions intact for the single final snapshot.
+				assert!(log.response_snapshot.is_none());
+				assert_eq!(
+					response
+						.extensions()
+						.get::<TransformationMetadata>()
+						.unwrap()
+						.0,
+					metadata.0
+				);
+				assert_eq!(
+					response
+						.extensions()
+						.get::<cel::ProxyContext>()
+						.and_then(|context| context.error.as_ref())
+						.is_some(),
+					failed
+				);
+				set_final_response_fields(&mut log, &reason, &mut response);
+				assert_eq!(log.status, Some(response.status()));
+				assert_eq!(log.reason, Some(reason));
+				let snapshot = log.response_snapshot.as_ref().unwrap();
+				assert_eq!(snapshot.metadata.as_ref().unwrap().0, metadata.0);
+				let error = snapshot
+					.proxy
+					.as_ref()
+					.and_then(|context| context.error.as_ref());
+				assert_eq!(error.is_some(), failed);
+				if let Some(error) = error {
+					assert_eq!(Some(&error.message), log.error.as_ref());
+					assert_eq!(
+						error.reason,
+						if policy == "direct" {
+							original_reason
+						} else {
+							reason
+						}
+						.to_string()
+					);
+				}
+				drop(DropOnLog::from(log));
+				let encoded = encoded_metrics(&registry);
+				let count = encoded
+					.lines()
+					.find(|line| line.starts_with("gen_ai_server_request_duration_count"))
+					.unwrap();
+				assert_eq!(count.contains("error_type=\"_OTHER\""), failed, "{count}");
+			}
+		}
+	}
+
+	#[test]
+	fn gen_ai_metrics_use_the_request_operation() {
+		for (format, operation) in [
+			(InputFormat::Completions, "chat"),
+			(InputFormat::Messages, "chat"),
+			(InputFormat::Responses, "chat"),
+			(InputFormat::Gemini, "generate_content"),
+			(InputFormat::Embeddings, "embeddings"),
+			(InputFormat::Realtime, "realtime"),
+			(InputFormat::Rerank, "rerank"),
+			(InputFormat::Decisions, "decisions"),
+			(InputFormat::CountTokens, "count_tokens"),
+			(InputFormat::GeminiCountTokens, "count_tokens"),
+			(InputFormat::Detect(None), "unknown"),
+			(InputFormat::Detect(Some(DetectedOperation::Chat)), "chat"),
+		] {
+			for streaming in [false, true] {
+				for has_response in [false, true] {
+					let (mut log, registry) = test_request_log_with_registry();
+					let mut request = metric_test_llm_request();
+					request.input_format = format;
+					request.streaming = streaming;
+					log.llm_request = Some(request.clone());
+					if has_response {
+						log.llm_response.store(Some(llm::LLMInfo::new(
+							request,
+							llm::LLMResponse {
+								input_tokens: Some(10),
+								..Default::default()
+							},
+						)));
+						log.status = Some(http::StatusCode::OK);
+					} else {
+						log.error = Some("connection failed".to_string());
+					}
+					drop(DropOnLog::from(log));
+					let encoded = encoded_metrics(&registry);
+					let counts: Vec<_> = encoded
+						.lines()
+						.filter(|line| {
+							line.starts_with("gen_ai_server_request_duration_count")
+								|| line.starts_with("gen_ai_client_token_usage_count")
+						})
+						.collect();
+					assert_eq!(counts.len(), if has_response { 2 } else { 1 });
+					for count in counts {
+						assert!(
+							count.contains(&format!("gen_ai_operation_name=\"{operation}\"")),
+							"{count}"
+						);
+					}
+				}
+			}
+		}
+	}
+
+	#[test]
+	fn gen_ai_request_duration_requires_a_recognized_llm_operation() {
+		let (mut log, registry) = test_request_log_with_registry();
+		log.status = Some(http::StatusCode::BAD_GATEWAY);
+		log.error = Some("connection failed".to_string());
+		log.reason = Some(ProxyResponseReason::UpstreamFailure);
+
+		drop(DropOnLog::from(log));
+
+		let encoded = encoded_metrics(&registry);
+		assert!(
+			!encoded
+				.lines()
+				.any(|line| line.starts_with("gen_ai_server_request_duration_count")),
+			"non-GenAI request emitted a GenAI duration observation:\n{encoded}"
+		);
+	}
+
+	#[test]
+	fn gen_ai_error_type_is_specific_to_request_duration() {
+		let (mut log, registry) = test_request_log_with_registry();
+		let request = metric_test_llm_request();
+		let response = llm::LLMResponse {
+			input_tokens: Some(10),
+			output_tokens: Some(5),
+			..Default::default()
+		};
+		log.status = Some(http::StatusCode::INTERNAL_SERVER_ERROR);
+		log.llm_request = Some(request.clone());
+		log
+			.llm_response
+			.store(Some(llm::LLMInfo::new(request, response)));
+
+		drop(DropOnLog::from(log));
+
+		let encoded = encoded_metrics(&registry);
+		let duration_count = encoded
+			.lines()
+			.find(|line| line.starts_with("gen_ai_server_request_duration_count"))
+			.unwrap_or_else(|| panic!("no GenAI request duration count in:\n{encoded}"));
+		assert!(duration_count.contains("error_type=\"_OTHER\""));
+		for token_line in encoded
+			.lines()
+			.filter(|line| line.starts_with("gen_ai_client_token_usage"))
+		{
+			assert!(
+				!token_line.contains("error_type="),
+				"token metric unexpectedly has error.type: {token_line}"
+			);
+		}
 	}
 
 	#[test]
@@ -3081,11 +3718,14 @@ mod tests {
 	}
 
 	#[test]
-	fn default_health_treats_non_zero_grpc_status_as_unhealthy() {
+	fn default_health_treats_server_grpc_status_as_unhealthy() {
 		let mut log = test_request_log();
 		log.status = Some(http::StatusCode::OK);
 		log.grpc_status.store(Some(13));
 		assert!(DropOnLog::default_unhealthy(&log));
+
+		log.grpc_status.store(Some(3));
+		assert!(!DropOnLog::default_unhealthy(&log));
 
 		log.grpc_status.store(Some(0));
 		assert!(!DropOnLog::default_unhealthy(&log));
@@ -3242,6 +3882,7 @@ mod tests {
 			input_format: InputFormat::Messages,
 			cache_convention: llm::CacheTokenConvention::InputExcludesCache,
 			request_model: strng::literal!("claude"),
+			original_model: None,
 			provider: strng::literal!("anthropic"),
 			streaming: false,
 			params: llm::LLMRequestParams::default(),
@@ -3317,7 +3958,7 @@ mod tests {
 		let catalog_file = tempfile::NamedTempFile::new().unwrap();
 		fs_err::write(
 			catalog_file.path(),
-			r#"{"providers":{"openai":{"models":{"my-model":{"rates":{"input":"1","output":"2"}}}}}}"#,
+			r#"{"providers":{"openai":{"models":{"my-model":{"rates":{"input":"1","output":"2","perPage":"0.005"}}}}}}"#,
 		)
 		.unwrap();
 		let catalog = ModelCatalog::new(vec![crate::ModelCatalogSource::File {
@@ -3330,6 +3971,7 @@ mod tests {
 			input_format: InputFormat::Completions,
 			cache_convention: llm::CacheTokenConvention::InputIncludesCache,
 			request_model: strng::literal!("my-model"),
+			original_model: None,
 			provider: strng::literal!("openai"),
 			streaming: false,
 			params: llm::LLMRequestParams::default(),
@@ -3339,6 +3981,7 @@ mod tests {
 		let response = llm::LLMResponse {
 			input_tokens: Some(1_000_000),
 			output_tokens: Some(0),
+			pages: Some(4),
 			..Default::default()
 		};
 		for _ in 0..20 {
@@ -3376,6 +4019,16 @@ mod tests {
 		] {
 			assert!(has(expected), "expected {expected} span attribute");
 		}
+		let value = |key: &str| {
+			span
+				.attributes
+				.iter()
+				.find(|attr| attr.key.as_str() == key)
+				.map(|attr| attr.value.to_string())
+		};
+		// 1M input tokens at $1/1M plus 4 pages at $0.005/page: the page line is priced per page.
+		assert_eq!(value("agw.ai.usage.cost.pages").as_deref(), Some("0.020"));
+		assert_eq!(value("agw.ai.usage.cost.total").as_deref(), Some("1.020"));
 		assert!(
 			span
 				.attributes
@@ -3389,6 +4042,39 @@ mod tests {
 				.iter()
 				.all(|attr| attr.key.as_str() != "agw.usage.cost"),
 			"cost should use the AGW AI usage namespace"
+		);
+	}
+
+	#[test]
+	fn original_model_span_attribute() {
+		let (tracer, exporter) = test_tracer();
+		let mut log = test_request_log();
+		log.tracer = Some(tracer.clone());
+		let mut outgoing = trc::TraceParent::new();
+		outgoing.flags = 1;
+		log.outgoing_span = Some(outgoing);
+		log.llm_request = Some(metric_test_llm_request());
+		log.original_model = Some("smart-model".to_string());
+
+		drop(DropOnLog::from(log));
+		let _ = tracer.provider.force_flush();
+
+		let spans = exporter.finished_spans();
+		let span = spans
+			.iter()
+			.find(|span| span.name.as_ref() == "unknown")
+			.expect("request span should be exported");
+		let value = |key: &str| {
+			span
+				.attributes
+				.iter()
+				.find(|attr| attr.key.as_str() == key)
+				.map(|attr| attr.value.to_string())
+		};
+		assert_eq!(value("gen_ai.request.model").as_deref(), Some("test-model"));
+		assert_eq!(
+			value("agw.ai.original_model").as_deref(),
+			Some("smart-model")
 		);
 	}
 

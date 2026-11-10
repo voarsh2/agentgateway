@@ -178,8 +178,8 @@ func CreateAgwResponseHeadersFilter(filter *gwv1.HTTPHeaderFilter) *api.HeaderMo
 	}
 }
 
-// CreateAgwRewriteFilter creates an agw TrafficPolicySpec based on a HTTPURLRewriteFilter
-func CreateAgwRewriteFilter(filter *gwv1.HTTPURLRewriteFilter) *api.TrafficPolicySpec {
+// CreateAgwRewriteFilter creates an agw UrlRewrite based on a HTTPURLRewriteFilter
+func CreateAgwRewriteFilter(filter *gwv1.HTTPURLRewriteFilter) *api.UrlRewrite {
 	if filter == nil {
 		return nil
 	}
@@ -199,11 +199,7 @@ func CreateAgwRewriteFilter(filter *gwv1.HTTPURLRewriteFilter) *api.TrafficPolic
 			ff.Path = &api.UrlRewrite_Full{Full: *filter.Path.ReplaceFullPath}
 		}
 	}
-	return &api.TrafficPolicySpec{
-		Kind: &api.TrafficPolicySpec_UrlRewrite{
-			UrlRewrite: ff,
-		},
-	}
+	return ff
 }
 
 // CreateAgwMirrorFilter creates an agw RequestMirror based on a HTTPRequestMirrorFilter
@@ -267,7 +263,7 @@ func CreateAgwExternalAuthFilter(
 	}
 	if b := filter.ForwardBody; b != nil {
 		pol.IncludeRequestBody = &api.TrafficPolicySpec_ExternalAuth_BodyOptions{
-			MaxRequestBytes: uint32(b.MaxSize),
+			MaxRequestBytes: uint32(b.MaxSize), //nolint:gosec // G115: kubebuilder validation ensures 0 <= value
 			// "Bodies over that size must fail processing"
 			AllowPartialMessage: false,
 			// TODO(https://github.com/kubernetes-sigs/gateway-api/issues/4198): do we want this?

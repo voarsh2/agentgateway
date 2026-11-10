@@ -43,6 +43,7 @@ type ReferenceTypes struct {
 	PolicyTargetsBySelector func(krtctx krt.HandlerContext, policyNamespace string, selector agentgateway.LocalPolicyTargetSelectorWithSectionName) []ResolvedPolicySelectorTarget
 	PolicyBackend           func(krtctx krt.HandlerContext, defaultNamespace string, gk schema.GroupKind, name gwv1.ObjectName, namespace *gwv1.Namespace, port *gwv1.PortNumber) (*api.BackendReference, error)
 	RouteBackend            func(krtctx krt.HandlerContext, defaultNamespace string, gk schema.GroupKind, name gwv1.ObjectName, namespace *gwv1.Namespace, port *gwv1.PortNumber) (*api.BackendReference, error)
+	// Parent kinds must be unique across groups; built-in parent kind names are reserved.
 	AllowedParentReferences sets.Set[schema.GroupKind]
 }
 
@@ -79,6 +80,9 @@ func DefaultReferenceTypes(agw *AgwCollections) ReferenceTypes {
 		// An AgentgatewayBackend is a grant source for its own backendRefs,
 		// e.g. spec.policies.mcp.authentication.jwks.remote.
 		wellknown.AgentgatewayBackendGVK.GroupKind(),
+		// An AgentgatewayModel is a grant source for its own backendRefs,
+		// e.g. spec.virtualModel.callout and spec.policies.promptGuard webhooks.
+		wellknown.AgentgatewayModelGVK.GroupKind(),
 		wellknown.GatewayGVK.GroupKind(),
 		wellknown.HTTPRouteGVK.GroupKind(),
 		wellknown.GRPCRouteGVK.GroupKind(),
@@ -89,6 +93,7 @@ func DefaultReferenceTypes(agw *AgwCollections) ReferenceTypes {
 	knownToReferences := sets.New(
 		wellknown.ServiceGVK.GroupKind(),
 		wellknown.SecretGVK.GroupKind(),
+		wellknown.ConfigMapGVK.GroupKind(),
 		wellknown.AgentgatewayBackendGVK.GroupKind(),
 		wellknown.HTTPRouteGVK.GroupKind(),
 		wellknown.InferencePoolGVK.GroupKind(),
@@ -124,7 +129,7 @@ func DefaultReferenceTypes(agw *AgwCollections) ReferenceTypes {
 					return nil, fmt.Errorf("unsupported target kind %s", gk.Kind)
 				}
 				return []*api.PolicyTarget{{
-					Kind: utils.BackendTarget(namespace, string(name), sectionName),
+					Kind: utils.TypedBackendTarget(wellknown.XBackendGVK.Kind, namespace, string(name), sectionName),
 				}}, checkExists(krtctx, agw.XBackends, gk.Kind, namespace, string(name))
 			case wellknown.ServiceGVK.GroupKind():
 				return []*api.PolicyTarget{{
@@ -189,7 +194,7 @@ func DefaultReferenceTypes(agw *AgwCollections) ReferenceTypes {
 				}
 				for _, backend := range krt.Fetch(krtctx, agw.XBackends, krt.FilterLabel(selector.MatchLabels), krt.FilterIndex(agw.XBackendsByNamespace, policyNamespace)) {
 					policyTargets := []*api.PolicyTarget{{
-						Kind: utils.BackendTarget(backend.Namespace, backend.Name, sectionName),
+						Kind: utils.TypedBackendTarget(wellknown.XBackendGVK.Kind, backend.Namespace, backend.Name, sectionName),
 					}}
 					targets = append(targets, ResolvedPolicySelectorTarget{Name: gwv1.ObjectName(backend.Name), Namespace: backend.Namespace, PolicyTargets: policyTargets})
 				}
@@ -394,13 +399,15 @@ func resolveXBackend(
 			Message: fmt.Sprintf("XBackend %s must be an ExternalHostname backend", key),
 		}
 	}
-	return &api.BackendReference{Kind: &api.BackendReference_Backend{Backend: key}}, nil
+	return &api.BackendReference{Kind: &api.BackendReference_Backend{Backend: utils.InternalTypedBackendKey(
+		wellknown.XBackendGVK.Group, wellknown.XBackendGVK.Kind, namespace, string(name),
+	)}}, nil
 }
 
 type RouteAttachment struct {
 	// Route
 	From utils.TypedNamespacedName
-	// Immediate parent (Gateway or ListenerSet)
+	// Immediate parent (Gateway, ListenerSet, or extension). Service parents use the eventual Gateway.
 	To           utils.TypedNamespacedName
 	ListenerName string
 	// Eventual parent (always Gateway)

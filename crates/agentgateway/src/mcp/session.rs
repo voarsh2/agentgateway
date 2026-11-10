@@ -13,8 +13,9 @@ use agent_core::version::BuildInfo;
 use anyhow::anyhow;
 use futures_util::StreamExt;
 use headers::HeaderMapExt;
+use http_body_util::BodyExt as _;
 use rmcp::model::{
-	ClientInfo, ClientJsonRpcMessage, ClientNotification, ClientRequest, ConstString, GetMeta,
+	ClientConfig, ClientJsonRpcMessage, ClientNotification, ClientRequest, ConstString, GetMeta,
 	Implementation, InitializeRequest, JsonRpcRequest, ProtocolVersion, Reference, RequestId,
 	RequestMetaObject, ServerJsonRpcMessage,
 };
@@ -33,6 +34,10 @@ use crate::proxy::ProxyError;
 use crate::telemetry::log::AsyncLog;
 use crate::types::agent::ResourceName;
 use crate::{mcp, *};
+
+// send_internal is awaited inline, so its size can enlarge every send future that awaits it.
+// A larger future usually means some value is now held across an await.
+const SEND_INTERNAL_FUTURE_SIZE: usize = 6 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct Session {
@@ -59,7 +64,7 @@ impl Session {
 	/// send a message to upstream server(s)
 	pub async fn send(
 		&mut self,
-		parts: Parts,
+		ctx: IncomingRequestContext,
 		message: ClientJsonRpcMessage,
 	) -> Result<Response, ProxyError> {
 		let req_id = match &message {
@@ -67,8 +72,8 @@ impl Session {
 			_ => None,
 		};
 		let res = self
-			.send_internal(parts, message)
-			.assert_size::<{ 6 * 1024 }>()
+			.send_internal(ctx, message)
+			.assert_size::<{ SEND_INTERNAL_FUTURE_SIZE }>()
 			.await;
 		Self::handle_error(req_id, res, false).await
 	}
@@ -81,7 +86,7 @@ impl Session {
 	/// handshake.
 	pub async fn stateless_send_and_initialize(
 		&mut self,
-		parts: Parts,
+		ctx: IncomingRequestContext,
 		message: ClientJsonRpcMessage,
 		initialize_upstream: bool,
 	) -> Result<Response, ProxyError> {
@@ -93,9 +98,11 @@ impl Session {
 			ClientJsonRpcMessage::Request(r) if matches!(r.request, ClientRequest::InitializeRequest(_)));
 		if initialize_upstream && !is_init {
 			let mut client_info = get_client_info();
-			if let Some(protocol_version) =
-				crate::mcp::streamablehttp::protocol_version_header(&parts.headers, req_id.clone(), true)?
-			{
+			if let Some(protocol_version) = crate::mcp::streamablehttp::protocol_version_header(
+				ctx.request.headers(),
+				req_id.clone(),
+				true,
+			)? {
 				client_info.protocol_version = protocol_version;
 			}
 			let init_request = rmcp::model::InitializeRequest::new(client_info);
@@ -119,11 +126,19 @@ impl Session {
 						Err(err) => return Self::handle_error(req_id.clone(), Err(err), false).await,
 					};
 					let res = self
-						.send_init_single(parts.clone(), init_request, service_name)
+						.send_init_single(ctx.clone(), init_request, service_name)
 						.await;
 					if let Some(sessions) = self.relay.get_sessions() {
 						let s = http::sessionpersistence::SessionState::MCP(
-							http::sessionpersistence::MCPSessionState::new(sessions),
+							http::sessionpersistence::MCPSessionState::new(
+								sessions,
+								self
+									.relay
+									.backend_id
+									.as_ref()
+									.filter(|_| matches!(self.encoder, http::sessionpersistence::Encoder::Aes(_)))
+									.map(ToString::to_string),
+							),
 						);
 						if let Ok(id) = s.encode(&self.encoder) {
 							self.id = id.into();
@@ -134,7 +149,7 @@ impl Session {
 					let _ = Self::handle_error(
 						None,
 						self
-							.send_initialized_notification_single(parts.clone(), service_name)
+							.send_initialized_notification_single(ctx.clone(), service_name)
 							.await,
 						false,
 					)
@@ -144,7 +159,7 @@ impl Session {
 					// We should fan out the initialize request to all MCP servers
 					let _ = self
 						.send(
-							parts.clone(),
+							ctx.clone(),
 							ClientJsonRpcMessage::request(init_request.into(), RequestId::Number(0)),
 						)
 						.await?;
@@ -155,17 +170,17 @@ impl Session {
 						}
 						.into(),
 					);
-					let _ = self.send(parts.clone(), notification).await?;
+					let _ = self.send(ctx.clone(), notification).await?;
 				},
 			}
 		}
 		// Now we can send the message like normal (if it's tools/call, it'll go to the initialized target)
 		if initialize_upstream {
-			return self.send(parts, message).await;
+			return self.send(ctx, message).await;
 		}
 		let res = self
-			.send_internal(parts, message)
-			.assert_size::<{ 6 * 1024 }>()
+			.send_internal(ctx, message)
+			.assert_size::<{ SEND_INTERNAL_FUTURE_SIZE }>()
 			.await;
 		match res {
 			// Modern requests are never part of a legacy session, so method-not-found can use its
@@ -178,7 +193,7 @@ impl Session {
 	}
 
 	pub fn with_inputs(mut self, inputs: RelayInputs) -> Self {
-		self.relay = Arc::new(self.relay.with_policies(inputs.policies));
+		self.relay = Arc::new(self.relay.with_inputs(inputs));
 		self
 	}
 
@@ -275,20 +290,26 @@ impl Session {
 		backend: &str,
 		method: &Strng,
 		params: &mut P,
+		extensions: &mut rmcp::model::Extensions,
 		ctx: &mut IncomingRequestContext,
 		res: rbac::ResourceType,
 		resource_type: &str,
 		resource_name: &str,
 	) -> Result<(), UpstreamError>
 	where
-		P: serde::Serialize + serde::de::DeserializeOwned,
+		P: serde::Serialize
+			+ serde::de::DeserializeOwned
+			+ std::fmt::Debug
+			+ Send
+			+ Sync
+			+ rmcp::model::RequestParamsMeta,
 	{
 		// run guardrails before other policies, as it may add context to CEL
 		self
 			.relay
-			.maybe_run_guardrails_call_request(backend, method, params, ctx)
+			.maybe_run_guardrails_call_request(backend, method, params, extensions, ctx)
 			.await?;
-		let cel = rbac::CelExecWrapper::new(ctx.as_request().map(|_| ()));
+		let cel = rbac::CelExecWrapper::from(ctx.clone());
 		if self.relay.policies.validate(&res, method, &cel) {
 			Ok(())
 		} else {
@@ -308,7 +329,7 @@ impl Session {
 	/// delete any active sessions
 	pub async fn delete_session(&self, parts: Parts) -> Result<Response, ProxyError> {
 		let ctx = IncomingRequestContext::new(&parts);
-		let (log, _cel) = mcp::handler::setup_request_log(parts);
+		let (log, _cel) = mcp::handler::setup_request_log(&ctx);
 		let session_id = (!self.synthetic).then(|| self.id.to_string());
 		log.non_atomic_mutate(|l| {
 			// NOTE: l.method_name keep None to respect the metrics logic: not handle GET, DELETE.
@@ -365,7 +386,7 @@ impl Session {
 	/// get_stream establishes a stream for server-sent messages
 	pub async fn get_stream(&self, parts: Parts) -> Result<Response, ProxyError> {
 		let ctx = IncomingRequestContext::new(&parts);
-		let (log, _cel) = mcp::handler::setup_request_log(parts);
+		let (log, _cel) = mcp::handler::setup_request_log(&ctx);
 		let session_id = (!self.synthetic).then(|| self.id.to_string());
 		log.non_atomic_mutate(|l| {
 			// NOTE: l.method_name keep None to respect the metrics logic: which do not want to handle GET, DELETE.
@@ -382,15 +403,17 @@ impl Session {
 		match d {
 			Ok(r) => Ok(r),
 			Err(UpstreamError::Http(ClientError::Status(resp))) => {
-				let resp = http::SendDirectResponse::new(*resp)
-					.await
-					.map_err(ProxyError::Body)?;
-				Err(mcp::Error::UpstreamError(Box::new(resp)).into())
+				Err(mcp::Error::UpstreamError(Box::new(http::SyncResponse::new(*resp))).into())
 			},
 			Err(UpstreamError::Proxy(p)) => Err(p),
-			// Preserve backend-auth error classification through the MCP HTTP transport.
+			// Preserve backend-auth error classification, and responses from backend policies (such
+			// as an ext_authz deny), through the MCP HTTP transport.
 			Err(UpstreamError::Http(ClientError::Proxy(
-				p @ (ProxyError::InvalidRequest | ProxyError::BackendAuthenticationFailed(_)),
+				p @ (ProxyError::InvalidRequest
+				| ProxyError::BackendAuthenticationFailed(_)
+				| ProxyError::JwtAuthenticationFailure(_)
+				| ProxyError::McpAuthenticationFailure(_, _)
+				| ProxyError::DirectResponse { .. }),
 			))) => Err(p),
 			Err(UpstreamError::Authorization {
 				resource_type,
@@ -398,9 +421,19 @@ impl Session {
 			}) if req_id.is_some() => {
 				Err(mcp::Error::Authorization(req_id.unwrap(), resource_type, resource_name).into())
 			},
-			Err(UpstreamError::McpGuardrails(rej)) if req_id.is_some() => {
-				Err(mcp::Error::McpGuardrails(req_id.unwrap(), rej).into())
-			},
+			Err(UpstreamError::McpGuardrails {
+				rej,
+				was_tool_call,
+				downstream_modern: modern,
+			}) if req_id.is_some() => Err(
+				mcp::Error::McpGuardrails {
+					request_id: req_id.unwrap(),
+					rej,
+					was_tool_call,
+					downstream_modern: modern,
+				}
+				.into(),
+			),
 			Err(UpstreamError::InvalidRequest(message)) if req_id.is_some() && downstream_modern => {
 				Err(mcp::Error::InvalidParams(req_id, message).into())
 			},
@@ -414,13 +447,12 @@ impl Session {
 
 	async fn send_init_single(
 		&self,
-		parts: Parts,
+		ctx: IncomingRequestContext,
 		mut init_request: InitializeRequest,
 		service_name: &str,
 	) -> Result<Response, UpstreamError> {
 		let method: Strng = init_request.method.as_str().into();
-		let ctx = IncomingRequestContext::new(&parts);
-		let (log, _) = mcp::handler::setup_request_log(parts);
+		let (log, _) = mcp::handler::setup_request_log(&ctx);
 		let session_id = (!self.synthetic).then(|| self.id.to_string());
 		log.non_atomic_mutate(|l| {
 			l.method_name = Some(method.clone());
@@ -441,7 +473,7 @@ impl Session {
 
 	async fn send_initialized_notification_single(
 		&self,
-		parts: Parts,
+		ctx: IncomingRequestContext,
 		service_name: &str,
 	) -> Result<Response, UpstreamError> {
 		let initialized = rmcp::model::InitializedNotification {
@@ -449,8 +481,7 @@ impl Session {
 			extensions: Default::default(),
 		};
 		let method: Strng = initialized.method.as_str().into();
-		let ctx = IncomingRequestContext::new(&parts);
-		let (log, _) = mcp::handler::setup_request_log(parts);
+		let (log, _) = mcp::handler::setup_request_log(&ctx);
 		let session_id = (!self.synthetic).then(|| self.id.to_string());
 		log.non_atomic_mutate(|l| {
 			l.method_name = Some(method.clone());
@@ -465,7 +496,7 @@ impl Session {
 
 	async fn send_internal(
 		&mut self,
-		parts: Parts,
+		mut ctx: IncomingRequestContext,
 		message: ClientJsonRpcMessage,
 	) -> Result<Response, UpstreamError> {
 		// Sending a message entails fanning out the message to each upstream, and then aggregating the responses.
@@ -478,8 +509,7 @@ impl Session {
 		match message {
 			ClientJsonRpcMessage::Request(mut r) => {
 				let method: Strng = r.request.method().into();
-				let mut ctx = IncomingRequestContext::new(&parts);
-				let (log, cel) = mcp::handler::setup_request_log(parts);
+				let (log, cel) = mcp::handler::setup_request_log(&ctx);
 				let session_id = (!self.synthetic).then(|| self.id.to_string());
 				log.non_atomic_mutate(|l| {
 					l.method_name = Some(method.clone());
@@ -503,7 +533,15 @@ impl Session {
 						.await;
 						if let Some(sessions) = self.relay.get_sessions() {
 							let s = http::sessionpersistence::SessionState::MCP(
-								http::sessionpersistence::MCPSessionState::new(sessions),
+								http::sessionpersistence::MCPSessionState::new(
+									sessions,
+									self
+										.relay
+										.backend_id
+										.as_ref()
+										.filter(|_| matches!(self.encoder, http::sessionpersistence::Encoder::Aes(_)))
+										.map(ToString::to_string),
+								),
 							);
 							if let Ok(id) = s.encode(&self.encoder) {
 								self.id = id.into();
@@ -520,7 +558,12 @@ impl Session {
 						.await
 					},
 					ClientRequest::ListToolsRequest(_) => {
-						Box::pin(self.relay.send_fanout(r, ctx, self.relay.merge_tools())).await
+						Box::pin(
+							self
+								.relay
+								.send_list(r, ctx, self.relay.merge_tools(), self.encoder.clone()),
+						)
+						.await
 					},
 					// TODO(keithmattix): should we forward pings or should we do our own independent pings
 					// as heuristic for the connection pool (and handle client pings as a local reply from agentgateway)?
@@ -555,17 +598,29 @@ impl Session {
 						.await
 					},
 					ClientRequest::ListPromptsRequest(_) => {
-						Box::pin(self.relay.send_fanout(r, ctx, self.relay.merge_prompts())).await
-					},
-					ClientRequest::ListResourcesRequest(_) => {
-						Box::pin(self.relay.send_fanout(r, ctx, self.relay.merge_resources())).await
-					},
-					ClientRequest::ListResourceTemplatesRequest(_) => {
 						Box::pin(
 							self
 								.relay
-								.send_fanout(r, ctx, self.relay.merge_resource_templates()),
+								.send_list(r, ctx, self.relay.merge_prompts(), self.encoder.clone()),
 						)
+						.await
+					},
+					ClientRequest::ListResourcesRequest(_) => {
+						Box::pin(self.relay.send_list(
+							r,
+							ctx,
+							self.relay.merge_resources(),
+							self.encoder.clone(),
+						))
+						.await
+					},
+					ClientRequest::ListResourceTemplatesRequest(_) => {
+						Box::pin(self.relay.send_list(
+							r,
+							ctx,
+							self.relay.merge_resource_templates(),
+							self.encoder.clone(),
+						))
 						.await
 					},
 					ClientRequest::CallToolRequest(ctr) => {
@@ -594,6 +649,7 @@ impl Session {
 							&service_name,
 							&mcp::guardrails::methods::TOOLS_CALL,
 							&mut ctr.params,
+							&mut ctr.extensions,
 							&mut ctx,
 							rbac::ResourceType::Tool(rbac::ResourceId::new(
 								service_name.to_string(),
@@ -633,6 +689,7 @@ impl Session {
 							&service_name,
 							&mcp::guardrails::methods::PROMPTS_GET,
 							&mut gpr.params,
+							&mut gpr.extensions,
 							&mut ctx,
 							rbac::ResourceType::Prompt(rbac::ResourceId::new(
 								service_name.to_string(),
@@ -655,6 +712,7 @@ impl Session {
 							service_name,
 							&mcp::guardrails::methods::RESOURCES_READ,
 							&mut rrr.params,
+							&mut rrr.extensions,
 							&mut ctx,
 							rbac::ResourceType::Resource(rbac::ResourceId::new(
 								service_name.to_string(),
@@ -754,8 +812,7 @@ impl Session {
 					ClientNotification::CustomNotification(r) => r.method.as_str(),
 					_ => "unknown",
 				};
-				let ctx = IncomingRequestContext::new(&parts);
-				let (log, _cel) = mcp::handler::setup_request_log(parts);
+				let (log, _cel) = mcp::handler::setup_request_log(&ctx);
 				let session_id = (!self.synthetic).then(|| self.id.to_string());
 				log.non_atomic_mutate(|l| {
 					l.method_name = Some(method.into());
@@ -767,8 +824,7 @@ impl Session {
 			},
 
 			ClientJsonRpcMessage::Response(_) | ClientJsonRpcMessage::Error(_) => {
-				let ctx = IncomingRequestContext::new(&parts);
-				let (log, _cel) = mcp::handler::setup_request_log(parts);
+				let (log, _cel) = mcp::handler::setup_request_log(&ctx);
 				let session_id = (!self.synthetic).then(|| self.id.to_string());
 				log.non_atomic_mutate(|l| {
 					l.session_id = session_id;
@@ -852,10 +908,21 @@ impl SessionManager {
 			.get_or_init(|| tokio::spawn(run_idle_reaper(self.sessions.clone())).abort_handle());
 	}
 
-	pub fn get_session(&self, id: &str, builder: RelayInputs) -> Option<Session> {
+	pub fn get_session(
+		&self,
+		id: &str,
+		builder: RelayInputs,
+		ctx: &IncomingRequestContext,
+	) -> Option<Session> {
 		let mut sessions = self.sessions.write().ok()?;
 		let entry = sessions.get_mut(id)?;
-		if entry.backend_id != builder.backend_id {
+		if entry.backend_id != builder.backend_id
+			|| !entry
+				.session
+				.relay
+				.upstreams
+				.conditions_match(&builder.backend, ctx)
+		{
 			return None;
 		}
 		entry.last_access = Instant::now();
@@ -866,9 +933,16 @@ impl SessionManager {
 		&self,
 		id: &str,
 		builder: RelayInputs,
+		ctx: &IncomingRequestContext,
 	) -> Result<Option<Session>, mcp::Error> {
 		if let Some(s) = self.sessions.write().expect("poisoned").get_mut(id) {
-			if s.backend_id != builder.backend_id {
+			if s.backend_id != builder.backend_id
+				|| !s
+					.session
+					.relay
+					.upstreams
+					.conditions_match(&builder.backend, ctx)
+			{
 				return Ok(None);
 			}
 			s.last_access = Instant::now();
@@ -877,11 +951,18 @@ impl SessionManager {
 		let idle_ttl = builder.backend.session_idle_ttl;
 		let backend_id = builder.backend_id.clone();
 		let d = http::sessionpersistence::SessionState::decode(id, &self.encoder)
-			.map_err(|_| mcp::Error::InvalidSessionIdHeader)?;
+			.map_err(|_| mcp::Error::UnknownSession)?;
 		let http::sessionpersistence::SessionState::MCP(state) = d else {
 			return Ok(None);
 		};
-		let relay = builder.build_new_connections()?;
+		if state
+			.backend
+			.as_ref()
+			.is_some_and(|b| *b != backend_id.to_string())
+		{
+			return Ok(None);
+		}
+		let relay = builder.build_new_connections(ctx)?;
 		if let Err(err) = relay.set_sessions(state.sessions) {
 			warn!("failed to resume session: {err}");
 			return Ok(None);
@@ -979,21 +1060,21 @@ impl SessionManager {
 		(sess, rx)
 	}
 
+	/// Deletion is best effort: upstream failures are not reported to the client, and a target
+	/// that fails to close keeps its upstream session until that target's own idle timeout.
 	pub async fn delete_session(
 		&self,
-		backend_id: &ResourceName,
 		id: &str,
+		builder: RelayInputs,
 		parts: Parts,
-	) -> Option<Response> {
-		let sess = {
-			let mut sm = self.sessions.write().expect("write lock");
-			if sm.get(id)?.backend_id != *backend_id {
-				return None;
-			}
-			sm.remove(id)?.session
+	) -> Result<Option<Response>, mcp::Error> {
+		let ctx = IncomingRequestContext::new(&parts);
+		// Resume so a replica that never saw the session still closes its upstream sessions.
+		let Some(sess) = self.get_or_resume_session(id, builder, &ctx)? else {
+			return Ok(None);
 		};
-		// Swallow the error
-		sess.delete_session(parts).await.ok()
+		self.sessions.write().expect("write lock").remove(id);
+		Ok(sess.delete_session(parts).await.ok())
 	}
 }
 
@@ -1106,8 +1187,8 @@ impl sse_stream::Timer for TokioSseTimer {
 	}
 }
 
-fn get_client_info() -> ClientInfo {
-	let mut client_info = ClientInfo::default();
+fn get_client_info() -> ClientConfig {
+	let mut client_info = ClientConfig::default();
 	client_info.protocol_version = ProtocolVersion::V_2025_11_25;
 	client_info.capabilities = rmcp::model::ClientCapabilities::default();
 	client_info.client_info =

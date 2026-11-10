@@ -11,12 +11,12 @@ use aws_credential_types::provider::error::CredentialsError;
 use aws_sigv4::http_request::{SignableBody, sign};
 use aws_sigv4::sign::v4::SigningParams;
 use aws_types::region::Region;
-use quick_cache::sync::{Cache as BoundedCache, EntryAction, EntryResult};
 use regex::Regex;
 use secrecy::{ExposeSecret, SecretString};
 use tokio::sync::{Mutex, OnceCell};
 
 use super::BackendAuthError;
+use crate::http::expiring_cache::ExpiringCache;
 use crate::llm::bedrock::AwsRegion;
 use crate::util::ErrorContext;
 use crate::*;
@@ -85,11 +85,11 @@ const ASSUME_ROLE_CACHE_CAPACITY: usize = 8192;
 /// its own entry, so the cache must be bounded, and fetches are single-flight so N
 /// concurrent requests for the same key coalesce into one STS call.
 #[derive(Clone)]
-pub struct AwsAssumeRoleCache(Arc<BoundedCache<AssumeRoleCacheKey, Credentials>>);
+pub struct AwsAssumeRoleCache(ExpiringCache<AssumeRoleCacheKey, Credentials>);
 
 impl Default for AwsAssumeRoleCache {
 	fn default() -> Self {
-		Self(Arc::new(BoundedCache::new(ASSUME_ROLE_CACHE_CAPACITY)))
+		Self(ExpiringCache::new(ASSUME_ROLE_CACHE_CAPACITY))
 	}
 }
 
@@ -103,27 +103,21 @@ impl AwsAssumeRoleCache {
 		F: FnOnce() -> Fut,
 		Fut: Future<Output = anyhow::Result<Credentials>>,
 	{
-		let guard = match self
+		self
 			.0
-			.entry_async(&key, |_key, creds| {
-				if credentials_valid(creds) {
-					EntryAction::Retain(creds.clone())
-				} else {
-					EntryAction::ReplaceWithGuard
-				}
+			.get_or_fetch(key, || async {
+				let creds = fetch().await?;
+				let ttl = match creds.expiry() {
+					Some(expiry) => expiry
+						.duration_since(SystemTime::now())
+						.ok()
+						.and_then(|ttl| ttl.checked_sub(ASSUMED_CREDENTIAL_REFRESH_BUFFER))
+						.filter(|ttl| !ttl.is_zero()),
+					None => Some(Duration::MAX),
+				};
+				Ok::<_, anyhow::Error>((creds, ttl))
 			})
 			.await
-		{
-			EntryResult::Retained(creds) => return Ok(creds),
-			EntryResult::Vacant(guard) | EntryResult::Replaced(guard, _) => guard,
-			EntryResult::Removed(_, _) | EntryResult::Timeout => unreachable!(),
-		};
-
-		let creds = fetch().await?;
-		if credentials_valid(&creds) {
-			let _ = guard.insert(creds.clone());
-		}
-		Ok(creds)
 	}
 }
 
@@ -156,6 +150,46 @@ pub struct AwsAssumeRole {
 	)]
 	#[cfg_attr(feature = "schema", schemars(with = "Vec<AwsSessionTag>"))]
 	pub tags: AwsSessionTags,
+	/// Set when the role's trust policy requires `sts:ExternalId`. 2-1224 chars,
+	/// matching `[\w+=,.@:/-]`.
+	#[serde(
+		default,
+		skip_serializing_if = "Option::is_none",
+		deserialize_with = "de_external_id"
+	)]
+	pub external_id: Option<String>,
+}
+
+// STS ExternalId limits: https://docs.aws.amazon.com/STS/latest/APIReference/API_AssumeRole.html
+const MIN_EXTERNAL_ID_LEN: usize = 2;
+const MAX_EXTERNAL_ID_LEN: usize = 1224;
+
+/// The characters STS accepts in an ExternalId.
+static EXTERNAL_ID_CHARSET: LazyLock<Regex> =
+	LazyLock::new(|| Regex::new(r"^[\w+=,.@:/-]*$").expect("static regex compiles"));
+
+pub fn validate_external_id(id: &str) -> anyhow::Result<()> {
+	let len = id.chars().count();
+	if !(MIN_EXTERNAL_ID_LEN..=MAX_EXTERNAL_ID_LEN).contains(&len) {
+		anyhow::bail!(
+			"external id must be {MIN_EXTERNAL_ID_LEN}-{MAX_EXTERNAL_ID_LEN} characters, got {len}"
+		);
+	}
+	if !EXTERNAL_ID_CHARSET.is_match(id) {
+		anyhow::bail!("external id contains characters STS does not accept");
+	}
+	Ok(())
+}
+
+fn de_external_id<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+	D: serde::Deserializer<'de>,
+{
+	let id: Option<String> = Option::deserialize(deserializer)?;
+	if let Some(id) = &id {
+		validate_external_id(id).map_err(serde::de::Error::custom)?;
+	}
+	Ok(id)
 }
 
 /// An AWS STS session tag passed to AssumeRole for cost attribution.
@@ -555,6 +589,7 @@ fn signing_service_name<'a>(req: &'a http::Request, aws_auth: &'a AwsAuth) -> &'
 }
 
 pub(super) async fn sign_request(
+	client: &client::Client,
 	req: &mut http::Request,
 	aws_auth: &AwsAuth,
 ) -> Result<(), BackendAuthError> {
@@ -579,7 +614,19 @@ pub(super) async fn sign_request(
 		_ => None,
 	};
 	let lim = crate::http::buffer_limit(req);
-	let orig_body = std::mem::take(req.body_mut());
+	let body = match req
+		.body_mut()
+		.inspect(lim)
+		.await
+		.map_err(BackendAuthError::local)?
+	{
+		http::BodyInspection::Complete(body) => body,
+		http::BodyInspection::Partial(_) => {
+			return Err(BackendAuthError::local(anyhow::anyhow!(
+				"request body exceeds buffer limit of {lim} bytes"
+			)));
+		},
+	};
 	// Get the region based on auth mode
 	let region = match aws_auth {
 		AwsAuth::ExplicitConfig {
@@ -596,7 +643,7 @@ pub(super) async fn sign_request(
 				aws_region.region.as_str()
 			} else {
 				// Fall back to region from AWS config
-				let config = Box::pin(sdk_config()).await;
+				let config = Box::pin(sdk_config(client)).await;
 				config
 					.region()
 					.map(|r| r.as_ref())
@@ -610,6 +657,7 @@ pub(super) async fn sign_request(
 	let creds = tokio::time::timeout(
 		super::CLOUD_AUTH_TIMEOUT,
 		Box::pin(load_credentials(
+			client,
 			aws_auth,
 			region,
 			resolved_tags,
@@ -636,9 +684,6 @@ pub(super) async fn sign_request(
 		.map_err(BackendAuthError::local)?
 		.into();
 
-	let body = http::read_body_with_limit(orig_body, lim)
-		.await
-		.map_err(BackendAuthError::local)?;
 	let signable_request = aws_sigv4::http_request::SignableRequest::new(
 		req.method().as_str(),
 		req.uri().to_string().replace("http://", "https://"),
@@ -660,13 +705,6 @@ pub(super) async fn sign_request(
 		.map_err(BackendAuthError::local)?
 		.into_parts();
 	signature.apply_to_request_http1x(req);
-
-	req.headers_mut().insert(
-		http::header::CONTENT_LENGTH,
-		http::HeaderValue::from_str(&format!("{}", body.as_ref().len()))
-			.map_err(BackendAuthError::local)?,
-	);
-	*req.body_mut() = http::Body::from(body);
 
 	trace!("signed AWS request");
 	Ok(())
@@ -699,13 +737,19 @@ fn should_sign_header(name: &str) -> bool {
 }
 
 static SDK_CONFIG: OnceCell<SdkConfig> = OnceCell::const_new();
-async fn sdk_config<'a>() -> &'a SdkConfig {
+async fn sdk_config<'a>(client: &client::Client) -> &'a SdkConfig {
 	SDK_CONFIG
-		.get_or_init(|| async { aws_config::load_defaults(BehaviorVersion::v2026_01_12()).await })
+		.get_or_init(|| async {
+			aws_config::defaults(BehaviorVersion::v2026_01_12())
+				.http_client(client.clone())
+				.load()
+				.await
+		})
 		.await
 }
 
 async fn load_credentials(
+	client: &client::Client,
 	aws_auth: &AwsAuth,
 	signing_region: &str,
 	resolved_tags: Option<Arc<[(String, String)]>>,
@@ -713,6 +757,7 @@ async fn load_credentials(
 ) -> anyhow::Result<Credentials> {
 	if let (Some(assume_role), Some(cache)) = (aws_auth.assume_role(), aws_auth.assume_role_cache()) {
 		load_assumed_credentials(
+			client,
 			assume_role,
 			cache,
 			signing_region,
@@ -721,11 +766,14 @@ async fn load_credentials(
 		)
 		.await
 	} else {
-		load_source_credentials(aws_auth).await
+		load_source_credentials(client, aws_auth).await
 	}
 }
 
-async fn load_source_credentials(aws_auth: &AwsAuth) -> anyhow::Result<Credentials> {
+async fn load_source_credentials(
+	client: &client::Client,
+	aws_auth: &AwsAuth,
+) -> anyhow::Result<Credentials> {
 	match aws_auth {
 		AwsAuth::ExplicitConfig {
 			access_key_id,
@@ -761,7 +809,7 @@ async fn load_source_credentials(aws_auth: &AwsAuth) -> anyhow::Result<Credentia
 			}
 
 			// Load AWS configuration and credentials from environment/IAM
-			let config = Box::pin(sdk_config()).await;
+			let config = Box::pin(sdk_config(client)).await;
 
 			// Get credentials from the config
 			let creds = config
@@ -782,6 +830,7 @@ struct AssumeRoleCacheKey {
 	role_arn: String,
 	resolved_sts_region: String,
 	session_name: Option<String>,
+	external_id: Option<String>,
 	/// Sorted (key, value) pairs so the cache key is stable regardless of tag order.
 	tags: Arc<[(String, String)]>,
 }
@@ -803,13 +852,14 @@ fn effective_session_name(
 const ASSUMED_CREDENTIAL_REFRESH_BUFFER: Duration = Duration::from_secs(60);
 
 async fn load_assumed_credentials(
+	client: &client::Client,
 	assume_role: &AwsAssumeRole,
 	cache: &AwsAssumeRoleCache,
 	signing_region: &str,
 	resolved_tags: Option<Arc<[(String, String)]>>,
 	resolved_session_name: Option<String>,
 ) -> anyhow::Result<Credentials> {
-	let sts_region = resolve_sts_region(assume_role, signing_region).await?;
+	let sts_region = resolve_sts_region(client, assume_role, signing_region).await?;
 	// resolved_tags and resolved_session_name are Some iff the corresponding
 	// dynamic config is set (see sign_request); static-only configs use the
 	// configured values directly.
@@ -819,18 +869,23 @@ async fn load_assumed_credentials(
 		role_arn: assume_role.role_arn.clone(),
 		resolved_sts_region: sts_region.clone(),
 		session_name,
+		external_id: assume_role.external_id.clone(),
 		tags,
 	};
 
 	cache
 		.get_or_fetch(key.clone(), || async move {
-			let config = Box::pin(sdk_config()).await;
+			let config = Box::pin(sdk_config(client)).await;
 			let mut builder = AssumeRoleProvider::builder(&assume_role.role_arn)
 				.configure(config)
 				.region(Region::new(sts_region));
 
 			if let Some(session_name) = &key.session_name {
 				builder = builder.session_name(session_name.clone());
+			}
+
+			if let Some(external_id) = &key.external_id {
+				builder = builder.external_id(external_id.clone());
 			}
 
 			if !key.tags.is_empty() {
@@ -849,13 +904,14 @@ async fn load_assumed_credentials(
 }
 
 async fn resolve_sts_region(
+	client: &client::Client,
 	_assume_role: &AwsAssumeRole,
 	signing_region: &str,
 ) -> anyhow::Result<String> {
 	if !signing_region.is_empty() {
 		return Ok(signing_region.to_string());
 	}
-	let config = Box::pin(sdk_config()).await;
+	let config = Box::pin(sdk_config(client)).await;
 	config
 		.region()
 		.map(|r| r.as_ref().to_string())
@@ -920,8 +976,29 @@ mod cache_key_tests {
 				.session_name
 				.as_ref()
 				.and_then(|name| name.static_name().map(String::from)),
+			external_id: assume_role.external_id.clone(),
 			tags: assume_role.tags.static_tags(),
 		}
+	}
+
+	#[test]
+	fn different_external_ids_produce_different_keys() {
+		let base = AwsAssumeRole {
+			role_arn: "arn:aws:iam::123456789012:role/backend".to_string(),
+			session_name: None,
+			tags: tags(&[]),
+			external_id: Some("tenant-a".to_string()),
+		};
+		let other = AwsAssumeRole {
+			external_id: Some("tenant-b".to_string()),
+			..base.clone()
+		};
+		let unset = AwsAssumeRole {
+			external_id: None,
+			..base.clone()
+		};
+		assert_ne!(key_for(&base, "us-east-1"), key_for(&other, "us-east-1"));
+		assert_ne!(key_for(&base, "us-east-1"), key_for(&unset, "us-east-1"));
 	}
 
 	#[test]
@@ -930,6 +1007,7 @@ mod cache_key_tests {
 			role_arn: "arn:aws:iam::123456789012:role/backend".to_string(),
 			session_name: Some(AwsSessionName::Static("team-a".to_string())),
 			tags: tags(&[]),
+			external_id: None,
 		};
 		let other = AwsAssumeRole {
 			session_name: Some(AwsSessionName::Static("team-b".to_string())),
@@ -944,6 +1022,7 @@ mod cache_key_tests {
 			role_arn: "arn:aws:iam::123456789012:role/backend".to_string(),
 			session_name: Some(AwsSessionName::Static("static-name".to_string())),
 			tags: tags(&[]),
+			external_id: None,
 		};
 		// Static config, nothing resolved: the configured name is used.
 		assert_eq!(
@@ -970,6 +1049,7 @@ mod cache_key_tests {
 			role_arn: "arn:aws:iam::123456789012:role/backend".to_string(),
 			resolved_sts_region: "us-east-1".to_string(),
 			session_name: Some("team-a-invoicer".to_string()),
+			external_id: None,
 			tags: tags(&[]).static_tags(),
 		};
 		let resolved_key = AssumeRoleCacheKey {
@@ -985,9 +1065,11 @@ mod cache_key_tests {
 			role_arn: "arn:aws:iam::123456789012:role/backend".to_string(),
 			session_name: None,
 			tags: tags(&[("Team", "acme-payments")]),
+			external_id: None,
 		};
 		let other = AwsAssumeRole {
 			tags: tags(&[("Team", "acme-billing")]),
+			external_id: None,
 			..base.clone()
 		};
 		assert_ne!(key_for(&base, "us-east-1"), key_for(&other, "us-east-1"));
@@ -1001,6 +1083,7 @@ mod cache_key_tests {
 			role_arn: "arn:aws:iam::123456789012:role/backend".to_string(),
 			resolved_sts_region: "us-east-1".to_string(),
 			session_name: None,
+			external_id: None,
 			tags: tags(&[("Team", "acme")]).static_tags(),
 		};
 		let resolved_key = AssumeRoleCacheKey {
@@ -1153,13 +1236,14 @@ mod resolve_tags_tests {
 				role_arn: "arn:aws:iam::123456789012:role/backend".to_string(),
 				session_name: None,
 				tags: session_tags(vec![tag("App", None, Some(r#"request.headers["x-app"]"#))]),
+				external_id: None,
 			}),
 			source_credentials_cache: Default::default(),
 			assume_role_cache: Default::default(),
 		};
 		// No x-app header: resolution fails before any credential loading or STS call.
 		let mut req = request(&[], None);
-		let err = sign_request(&mut req, &auth)
+		let err = sign_request(&crate::test_helpers::test_client(), &mut req, &auth)
 			.await
 			.expect_err("must reject the request rather than sign it unattributed");
 		assert!(
@@ -1186,12 +1270,13 @@ mod resolve_tags_tests {
 					expression: Some(Arc::new(expression)),
 				}])
 				.expect("permissive expression should pass config validation"),
+				external_id: None,
 			}),
 			source_credentials_cache: Default::default(),
 			assume_role_cache: Default::default(),
 		};
 		let mut req = request(&[("x-app", "invoicer")], None);
-		let err = sign_request(&mut req, &auth)
+		let err = sign_request(&crate::test_helpers::test_client(), &mut req, &auth)
 			.await
 			.expect_err("uncompilable expression must fail the request");
 		assert!(
@@ -1312,13 +1397,14 @@ mod resolve_session_name_tests {
 				role_arn: "arn:aws:iam::123456789012:role/backend".to_string(),
 				session_name: Some(dynamic(r#"request.headers["x-team"]"#)),
 				tags: Default::default(),
+				external_id: None,
 			}),
 			source_credentials_cache: Default::default(),
 			assume_role_cache: Default::default(),
 		};
 		// No x-team header: resolution fails before any credential loading or STS call.
 		let mut req = request(&[], None);
-		let err = sign_request(&mut req, &auth)
+		let err = sign_request(&crate::test_helpers::test_client(), &mut req, &auth)
 			.await
 			.expect_err("must reject the request rather than sign it misattributed");
 		assert!(
@@ -1349,6 +1435,7 @@ mod assume_role_cache_tests {
 			role_arn: format!("arn:aws:iam::123456789012:role/{role}"),
 			resolved_sts_region: "us-east-1".to_string(),
 			session_name: None,
+			external_id: None,
 			tags: tags
 				.iter()
 				.map(|(k, v)| (k.to_string(), v.to_string()))

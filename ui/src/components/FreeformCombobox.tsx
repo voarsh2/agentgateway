@@ -5,7 +5,9 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { useDismissiblePopover } from '@/components/Primitives';
 
 export function FreeformCombobox(props: {
+	id?: string;
 	ariaLabel: string;
+	'aria-describedby'?: string;
 	value: string;
 	options: string[];
 	onChange: (value: string) => void;
@@ -27,9 +29,7 @@ export function FreeformCombobox(props: {
 	}, [browseAll, props.options, props.value]);
 
 	useEffect(() => {
-		const selectedIndex = browseAll
-			? filteredOptions.findIndex(option => option === props.value)
-			: -1;
+		const selectedIndex = browseAll ? filteredOptions.indexOf(props.value) : -1;
 		setActiveIndex(selectedIndex >= 0 ? selectedIndex : 0);
 	}, [browseAll, filteredOptions, props.value]);
 
@@ -86,7 +86,9 @@ export function FreeformCombobox(props: {
 			<div className="freeform-combobox-input-wrap">
 				<input
 					ref={inputRef}
+					id={props.id}
 					aria-label={props.ariaLabel}
+					aria-describedby={props['aria-describedby']}
 					value={props.value}
 					onChange={event => {
 						setBrowseAll(false);

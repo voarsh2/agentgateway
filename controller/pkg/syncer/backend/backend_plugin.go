@@ -10,6 +10,7 @@ import (
 	"istio.io/istio/pkg/kube/controllers"
 	"istio.io/istio/pkg/kube/krt"
 	"istio.io/istio/pkg/ptr"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -152,6 +153,9 @@ func BuildAgwBackend(
 	backend *agentgateway.AgentgatewayBackend,
 ) ([]*api.Backend, error) {
 	errs := []error{}
+	if owners := jwks.OwnersFromBackend(backend); len(owners) > 0 {
+		ctx.JWKSOwner = &owners[0]
+	}
 	pols, err := TranslateBackendPolicies(ctx, backend.Namespace, backend.Spec.Policies)
 	if err != nil {
 		errs = append(errs, err)
@@ -276,12 +280,27 @@ func TranslateAgwBackend(
 	}, results
 }
 
+func applyMCPTargetCondition(targets []*api.MCPTarget, condition *agentgateway.CELExpression) error {
+	if condition == nil {
+		return nil
+	}
+	for _, t := range targets {
+		t.Condition = new(string(*condition))
+	}
+	if !plugins.IsValidCELExpression(*condition) {
+		return fmt.Errorf("MCP target condition is not a valid CEL expression: %s", *condition)
+	}
+	return nil
+}
+
 func TranslateMCPBackends(ctx plugins.PolicyCtx, be *agentgateway.AgentgatewayBackend, inlinePolicies []*api.BackendPolicySpec) ([]*api.Backend, error) {
 	mcp := be.Spec.MCP
 	var mcpTargets []*api.MCPTarget
 	var backends []*api.Backend
 	var errs []error
+	serviceTargets := map[*api.MCPTarget]*corev1.Service{}
 	for _, target := range mcp.Targets {
+		start := len(mcpTargets)
 		if s := target.Static; s != nil {
 			if s.BackendRef != nil {
 				serviceHostname, err := ResolveMCPBackendRefHost(ctx, be.Namespace, s.BackendRef)
@@ -310,6 +329,9 @@ func TranslateMCPBackends(ctx plugins.PolicyCtx, be *agentgateway.AgentgatewayBa
 				}
 
 				mcpTargets = append(mcpTargets, mcpTarget)
+				if err := applyMCPTargetCondition(mcpTargets[start:], target.Condition); err != nil {
+					errs = append(errs, err)
+				}
 				continue
 			}
 
@@ -361,9 +383,17 @@ func TranslateMCPBackends(ctx plugins.PolicyCtx, be *agentgateway.AgentgatewayBa
 			if err != nil {
 				return nil, err
 			}
-			mcpTargets = append(mcpTargets, targets...)
+			for _, t := range targets {
+				serviceTargets[t.target] = t.service
+				mcpTargets = append(mcpTargets, t.target)
+			}
+		}
+		if err := applyMCPTargetCondition(mcpTargets[start:], target.Condition); err != nil {
+			errs = append(errs, err)
 		}
 	}
+	mcpTargets, dedupeErrs := dedupeMCPTargets(be.Namespace, mcpTargets, serviceTargets)
+	errs = append(errs, dedupeErrs...)
 	// defaults to stateful session routing
 	sessionRouting := api.MCPBackend_STATEFUL
 	if mcp.SessionRouting == agentgateway.Stateless {
@@ -468,6 +498,7 @@ func translateAIBackendPolicies(
 	}
 	return TranslateBackendPolicies(ctx, namespace, &agentgateway.BackendFull{
 		BackendSimple:  policies.BackendSimple,
+		Authorization:  policies.Authorization,
 		AI:             policies.AI,
 		Transformation: policies.Transformation,
 		Health:         policies.Health,
@@ -505,6 +536,10 @@ func translateLLMProvider(ctx plugins.PolicyCtx, namespace string, llm *agentgat
 				Model:      llm.OpenAI.Model,
 				Moderation: moderation,
 			},
+		}
+	} else if llm.Copilot != nil {
+		provider.Provider = &api.AIBackend_Provider_Copilot{
+			Copilot: &api.AIBackend_Copilot{Model: llm.Copilot.Model},
 		}
 	} else if llm.AzureOpenAI != nil {
 		resourceName, resourceType := parseAzureEndpoint(llm.AzureOpenAI.Endpoint)
@@ -546,17 +581,27 @@ func translateLLMProvider(ctx plugins.PolicyCtx, namespace string, llm *agentgat
 		// TODO: publisher?
 		provider.Provider = &api.AIBackend_Provider_Vertex{
 			Vertex: &api.AIBackend_Vertex{
-				Region:    llm.VertexAI.Region,
+				Region:    ptr.NonEmptyOrDefault(llm.VertexAI.Region, "global"),
 				Model:     llm.VertexAI.Model,
 				ProjectId: llm.VertexAI.ProjectId,
 			},
 		}
 	} else if llm.Bedrock != nil {
-		region := llm.Bedrock.Region
+		region := ptr.NonEmptyOrDefault(llm.Bedrock.Region, "us-east-1")
 		var guardrailIdentifier, guardrailVersion *string
 		if llm.Bedrock.Guardrail != nil {
 			guardrailIdentifier = &llm.Bedrock.Guardrail.GuardrailIdentifier
 			guardrailVersion = &llm.Bedrock.Guardrail.GuardrailVersion
+		}
+
+		endpointPreference := api.AIBackend_BEDROCK_ENDPOINT_PREFERENCE_RUNTIME_PREFERRED
+		switch llm.Bedrock.EndpointPreference {
+		case agentgateway.BedrockEndpointPreferenceMantlePreferred:
+			endpointPreference = api.AIBackend_BEDROCK_ENDPOINT_PREFERENCE_MANTLE_PREFERRED
+		case agentgateway.BedrockEndpointPreferenceMantleOnly:
+			endpointPreference = api.AIBackend_BEDROCK_ENDPOINT_PREFERENCE_MANTLE_ONLY
+		case agentgateway.BedrockEndpointPreferenceRuntimeOnly:
+			endpointPreference = api.AIBackend_BEDROCK_ENDPOINT_PREFERENCE_RUNTIME_ONLY
 		}
 
 		provider.Provider = &api.AIBackend_Provider_Bedrock{
@@ -565,6 +610,7 @@ func translateLLMProvider(ctx plugins.PolicyCtx, namespace string, llm *agentgat
 				Region:              region,
 				GuardrailIdentifier: guardrailIdentifier,
 				GuardrailVersion:    guardrailVersion,
+				EndpointPreference:  endpointPreference,
 			},
 		}
 	} else if llm.Custom != nil {

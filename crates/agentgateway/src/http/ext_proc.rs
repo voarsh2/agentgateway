@@ -1,5 +1,6 @@
 use std::convert::Infallible;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::anyhow;
 use bytes::Bytes;
@@ -12,6 +13,7 @@ use protos::envoy::service::ext_proc::v3::ProtocolConfiguration;
 use serde_json::Value as JsonValue;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::CancellationToken;
 
 use crate::cel::{Executor, Expression, RequestSnapshot};
 use crate::client::ResolvedDestination;
@@ -19,12 +21,12 @@ use crate::http::ext_proc::proto::{
 	HttpBody, HttpHeaders, HttpTrailers, Metadata, ProcessingRequest, ProcessingResponse,
 	processing_response,
 };
-use crate::http::{HeaderName, PolicyResponse, envoy_proto_common};
-use crate::proxy::ProxyError;
+use crate::http::{HeaderName, envoy_proto_common};
 use crate::proxy::dtrace::{self, pol_result};
 use crate::proxy::httpproxy::PolicyClient;
+use crate::proxy::{ProxyError, ProxyResponseReason};
 use crate::telemetry::metrics::{OutboundCallKind, OutboundCallSubtype};
-use crate::types::agent::{SimpleBackendReference, SimpleBackendReferenceWithPolicies};
+use crate::types::agent::{SimpleBackendReference, SimpleBackendReferenceWithPolicies, Target};
 use crate::{http, *};
 
 /// The namespace key used for ext_proc attributes in ProcessingRequest.attributes
@@ -127,9 +129,11 @@ pub use processing::{
 /// Controls how an endpoint-picker-selected destination is used.
 pub enum InferenceRoutingDestinationMode {
 	/// Require the selected destination to match agentgateway's local service endpoints.
+	/// Only IP destinations can be validated; a hostname destination is rejected.
 	#[default]
 	Validated,
 	/// Trust the selected destination directly without local endpoint validation.
+	/// The destination may be an IP address or a DNS hostname.
 	Passthrough,
 }
 
@@ -188,9 +192,8 @@ pub struct InferencePoolRouter {
 
 #[derive(Debug, Default)]
 pub struct InferenceRequestResult {
-	pub destination: Option<SocketAddr>,
+	pub destination: Option<Target>,
 	pub destination_mode: InferenceRoutingDestinationMode,
-	pub policy_response: PolicyResponse,
 	pub failed_open: bool,
 }
 
@@ -220,6 +223,15 @@ impl InferenceRouting {
 	}
 }
 
+/// Parses the EPP destination header (host:port). unix: paths are rejected so an
+/// EPP cannot point the proxy at a local socket.
+fn parse_destination(v: &str) -> anyhow::Result<Target> {
+	match Target::try_from(v)? {
+		Target::UnixSocket(_) => anyhow::bail!("expected host:port"),
+		t => Ok(t),
+	}
+}
+
 impl InferencePoolRouter {
 	pub fn is_enabled(&self) -> bool {
 		self.ext_proc.is_some()
@@ -238,32 +250,40 @@ impl InferencePoolRouter {
 		let (new_req, pr) = ext_proc.mutate_request(r).await?;
 		let failed_open = ext_proc.skipped;
 		*req = new_req;
+		if let Some(resp) = pr {
+			return Err(ProxyError::direct_response_from(
+				ProxyResponseReason::ExtProc,
+				resp,
+			));
+		}
 		let dest = req
 			.headers_mut()
 			.remove(&INFERENCE_DESTINATION_HEADER)
-			.and_then(|v| v.to_str().ok().map(|v| v.parse::<SocketAddr>()))
+			.and_then(|v| v.to_str().ok().map(parse_destination))
 			.transpose()
 			.map_err(|e| ProxyError::Processing(anyhow!("EPP returned invalid address: {e}")))?;
 		Ok(InferenceRequestResult {
 			destination: dest,
 			destination_mode: self.destination_mode,
-			policy_response: pr.unwrap_or_default(),
 			failed_open,
 		})
 	}
 
-	pub async fn mutate_response(
-		&mut self,
-		resp: &mut http::Response,
-	) -> Result<PolicyResponse, ProxyError> {
+	pub async fn mutate_response(&mut self, resp: &mut http::Response) -> Result<(), ProxyError> {
 		let rd = resp.extensions().get::<ResolvedDestination>().map(|d| d.0);
 		let Some(ext_proc) = &mut self.ext_proc else {
-			return Ok(Default::default());
+			return Ok(());
 		};
 		let r = std::mem::take(resp);
 		let (new_resp, pr) = ext_proc.mutate_response(r, None, rd).await?;
 		*resp = new_resp;
-		Ok(pr.unwrap_or_default())
+		if let Some(resp) = pr {
+			return Err(ProxyError::direct_response_from(
+				ProxyResponseReason::ExtProc,
+				resp,
+			));
+		}
+		Ok(())
 	}
 }
 
@@ -339,45 +359,56 @@ pub struct ExtProcRequest {
 }
 
 impl ExtProcRequest {
-	pub async fn mutate_request(
-		&mut self,
-		req: &mut http::Request,
-	) -> Result<PolicyResponse, ProxyError> {
+	pub async fn mutate_request(&mut self, req: &mut http::Request) -> Result<(), ProxyError> {
 		let Some(ext_proc) = &mut self.ext_proc else {
-			return Ok(PolicyResponse::default());
+			return Ok(());
 		};
 		let r = std::mem::take(req);
 		let (new_req, pr) = ext_proc.mutate_request(r).await?;
 		*req = new_req;
-		let pr = pr.unwrap_or_default();
 		pol_result!(
 			dtrace::Info,
 			Apply,
 			"ext_proc request ({})",
-			dtrace::policy_response_details(&pr)
+			pr.as_ref()
+				.map(|r| format!("returned direct response with status {}", r.status()))
+				.unwrap_or_default()
 		);
-		Ok(pr)
+		if let Some(resp) = pr {
+			return Err(ProxyError::direct_response_from(
+				ProxyResponseReason::ExtProc,
+				resp,
+			));
+		}
+		Ok(())
 	}
 
 	pub async fn mutate_response(
 		&mut self,
 		resp: &mut http::Response,
 		request: Option<&RequestSnapshot>,
-	) -> Result<PolicyResponse, ProxyError> {
+	) -> Result<(), ProxyError> {
 		let Some(ext_proc) = &mut self.ext_proc else {
-			return Ok(PolicyResponse::default());
+			return Ok(());
 		};
 		let r = std::mem::take(resp);
 		let (new_resp, pr) = ext_proc.mutate_response(r, request, None).await?;
 		*resp = new_resp;
-		let pr = pr.unwrap_or_default();
 		pol_result!(
 			dtrace::Info,
 			Apply,
 			"ext_proc response ({})",
-			dtrace::policy_response_details(&pr)
+			pr.as_ref()
+				.map(|r| format!("returned direct response with status {}", r.status()))
+				.unwrap_or_default()
 		);
-		Ok(pr)
+		if let Some(resp) = pr {
+			return Err(ProxyError::direct_response_from(
+				ProxyResponseReason::ExtProc,
+				resp,
+			));
+		}
+		Ok(())
 	}
 
 	pub fn take_body_immediate_response(&self) -> Option<http::Response> {
@@ -403,8 +434,14 @@ struct ExtProcInstance {
 	span_target: Arc<SimpleBackendReference>,
 	client: Option<proto::external_processor_client::ExternalProcessorClient<GrpcReferenceChannel>>,
 	tx_req: Option<Sender<ProcessingRequest>>,
+	// Completes on the transport's first poll, or errors if setup drops the stream first.
+	request_stream_polled: Option<tokio::sync::oneshot::Receiver<()>>,
 	rx_resp_for_request: Option<Receiver<ProcessingResponse>>,
 	rx_resp_for_response: Option<Receiver<ProcessingResponse>>,
+	cleanly_closed: Arc<AtomicBool>,
+	// Cancelled when the downstream drops while a request or response phase is awaiting the
+	// processor, resetting the gRPC stream so the processor can release any state (e.g. EPP queue slot).
+	cancel: CancellationToken,
 	metadata_context: Option<HashMap<String, HashMap<String, Arc<cel::Expression>>>>,
 	req_attributes: Option<HashMap<String, Arc<cel::Expression>>>,
 	resp_attributes: Option<HashMap<String, Arc<cel::Expression>>>,
@@ -438,8 +475,11 @@ impl ExtProcInstance {
 					.max_decoding_message_size(defaults::GRPC_MAX_DECODING_MESSAGE_SIZE),
 			),
 			tx_req: None,
+			request_stream_polled: None,
 			rx_resp_for_request: None,
 			rx_resp_for_response: None,
+			cleanly_closed: Arc::new(AtomicBool::new(false)),
+			cancel: CancellationToken::new(),
 			metadata_context,
 			req_attributes,
 			resp_attributes,
@@ -458,12 +498,24 @@ impl ExtProcInstance {
 			return Err(Error::RequestSend);
 		};
 		let failure_mode = self.failure_mode;
+		let cleanly_closed = self.cleanly_closed.clone();
 		let span_client = self.span_client.clone();
 		let span_target = self.span_target.clone();
-		let (tx_req, rx_req) = tokio::sync::mpsc::channel(10);
+		let cancel = self.cancel.clone();
+		let (tx_req, mut rx_req) = tokio::sync::mpsc::channel(10);
 		let (tx_resp, mut rx_resp) = tokio::sync::mpsc::channel(10);
-		let req_stream = tokio_stream::wrappers::ReceiverStream::new(rx_req);
-		dtrace::spawn(async move {
+		// Enqueueing a ProcessingRequest does not mean we connected to the processor.
+		// Signal when the outbound path actually starts reading the gRPC request stream,
+		// so mutate_request can keep the original HTTP body untouched during setup.
+		let (tx_polled, rx_polled) = tokio::sync::oneshot::channel();
+		let mut tx_polled = Some(tx_polled);
+		let req_stream = futures::stream::poll_fn(move |cx| {
+			if let Some(tx) = tx_polled.take() {
+				let _ = tx.send(());
+			}
+			rx_req.poll_recv(cx)
+		});
+		let process = async move {
 			let mut request = tonic::Request::new(req_stream);
 			*request.metadata_mut() = grpc_initial_metadata;
 			let mut span = span_client.start_grpc_span(
@@ -495,6 +547,7 @@ impl ExtProcInstance {
 						if let Some(span) = span.as_deref_mut() {
 							span.record_grpc_status(tonic::Code::Ok);
 						}
+						cleanly_closed.store(true, Ordering::Relaxed);
 						return;
 					},
 					Err(error) => {
@@ -505,6 +558,12 @@ impl ExtProcInstance {
 						return;
 					},
 				}
+			}
+		};
+		dtrace::spawn(async move {
+			tokio::select! {
+				_ = process => {},
+				_ = cancel.cancelled() => trace!("downstream dropped, resetting ext_proc stream"),
 			}
 		});
 
@@ -535,19 +594,25 @@ impl ExtProcInstance {
 		});
 
 		self.tx_req = Some(tx_req);
+		self.request_stream_polled = Some(rx_polled);
 		self.rx_resp_for_request = Some(rx_resp_for_request);
 		self.rx_resp_for_response = Some(rx_resp_for_response);
 		Ok(())
 	}
 
 	async fn send_request(&mut self, req: ProcessingRequest) -> Result<(), Error> {
-		self
+		let result = self
 			.tx_req
 			.as_ref()
 			.ok_or(Error::RequestSend)?
 			.send(req)
 			.await
-			.map_err(|_| Error::RequestSend)
+			.map_err(|_| Error::RequestSend);
+		if result.is_err() && self.cleanly_closed.load(Ordering::Relaxed) {
+			self.skipped = true;
+			return Ok(());
+		}
+		result
 	}
 
 	fn request_sender(&self) -> Result<Sender<ProcessingRequest>, Error> {
@@ -702,8 +767,9 @@ impl ExtProcInstance {
 		trailer_slot: Option<Arc<Mutex<Option<http::HeaderMap>>>>,
 		first_message: FirstExtProcMessage,
 		missing_body_message: &'static str,
+		downstream_dropped: Option<tokio::sync::oneshot::Receiver<()>>,
 	) {
-		tokio::task::spawn(Self::handle_body_stream(
+		let body_stream = Self::handle_body_stream(
 			metadata_context.clone(),
 			pending_body.take().expect(missing_body_message),
 			tx,
@@ -711,7 +777,17 @@ impl ExtProcInstance {
 			send_trailers,
 			trailer_slot,
 			first_message,
-		));
+		);
+		let Some(downstream_dropped) = downstream_dropped else {
+			tokio::task::spawn(body_stream);
+			return;
+		};
+		tokio::task::spawn(async move {
+			tokio::select! {
+				_ = body_stream => {},
+				_ = downstream_dropped => trace!("downstream dropped, stopping body stream"),
+			}
+		});
 	}
 
 	async fn recv_response_loop_message(
@@ -879,32 +955,42 @@ impl ExtProcInstance {
 	pub async fn mutate_request(
 		&mut self,
 		req: http::Request,
-	) -> Result<(http::Request, Option<PolicyResponse>), Error> {
-		let rebuffer = req.extensions().get::<cel::BufferedBody>().is_some();
-		let (mut req, response) = self.mutate_request_inner(req).await?;
-		if rebuffer && self.mode_state.request_body_mode != BodySendMode::None {
-			let body = http::inspect_body(&mut req)
-				.await
-				.map_err(|error| Error::BodyBuffer(error.to_string()))?;
-			req.extensions_mut().insert(cel::BufferedBody::from(body));
+	) -> Result<(http::Request, Option<http::Response>), Error> {
+		let cancel_on_drop = self.cancel.clone().drop_guard();
+		let result: Result<_, Error> = async {
+			let rebuffer = req.body().needs_inspection();
+			let (mut req, response) = self.mutate_request_inner(req).await?;
+			if rebuffer && self.mode_state.request_body_mode != BodySendMode::None {
+				let _ = http::inspect_body(&mut req)
+					.await
+					.map_err(|error| Error::BodyBuffer(error.to_string()))?;
+			}
+			Ok((req, response))
 		}
-		Ok((req, response))
+		.await;
+		cancel_on_drop.disarm();
+		result
 	}
 
 	async fn mutate_request_inner(
 		&mut self,
 		mut req: http::Request,
-	) -> Result<(http::Request, Option<PolicyResponse>), Error> {
+	) -> Result<(http::Request, Option<http::Response>), Error> {
 		let headers = req_to_header_map(&req);
 
-		let exec = cel::Executor::new_request(&req);
-		self.ensure_stream_started(&exec)?;
-		// request_attributes should only be sent on first ProcessingRequest
-		// this will need to be modified if we configure which Requests to send
-		// Wrap metadata_context in Arc for cheap cloning across body chunks
-		let metadata_context = build_processing_metadata_context(&exec, self.metadata_context.as_ref())
-			.map(|filter_metadata| Arc::new(Metadata { filter_metadata }));
-		let attributes = build_request_attributes(&exec, self.req_attributes.as_ref());
+		// Drop the executor before the first await so the request future does not store it.
+		let (metadata_context, attributes) = {
+			let exec = cel::Executor::new_request(&req);
+			self.ensure_stream_started(&exec)?;
+			// request_attributes should only be sent on first ProcessingRequest
+			// this will need to be modified if we configure which Requests to send
+			// Wrap metadata_context in Arc for cheap cloning across body chunks
+			let metadata_context =
+				build_processing_metadata_context(&exec, self.metadata_context.as_ref())
+					.map(|filter_metadata| Arc::new(Metadata { filter_metadata }));
+			let attributes = build_request_attributes(&exec, self.req_attributes.as_ref());
+			(metadata_context, attributes)
+		};
 
 		let failure_mode = self.failure_mode;
 		let request_trailers = Arc::new(Mutex::new(None));
@@ -956,6 +1042,9 @@ impl ExtProcInstance {
 				}
 				return Err(e);
 			}
+			if self.skipped {
+				return Ok((req, None));
+			}
 			self.mark_protocol_config_sent_if(sends_protocol_config);
 		}
 
@@ -968,6 +1057,20 @@ impl ExtProcInstance {
 				"complete_request_phase_preserves_original_body",
 			);
 			return Ok((req, None));
+		}
+
+		// Wait before handing the original body to a producer that can consume it.
+		// A setup failure drops the unpolled stream (and its one-shot sender), letting
+		// FailOpen return the intact request. Do not wait for client.process() or an EPP
+		// response here: a full-duplex processor may need the body before responding.
+		if let Some(polled) = self.request_stream_polled.take()
+			&& polled.await.is_err()
+		{
+			if failure_mode == FailureMode::FailOpen {
+				self.skipped = true;
+				return Ok((req, None));
+			}
+			return Err(Error::RequestSend);
 		}
 
 		let tx = self.tx_req.clone();
@@ -997,6 +1100,7 @@ impl ExtProcInstance {
 				Some(request_trailers.clone()),
 				first_message,
 				"request body should be available before streaming starts",
+				None,
 			);
 			self.mark_protocol_config_sent_if(sends_protocol_config);
 			request_body_started_to_ext_proc = true;
@@ -1168,8 +1272,7 @@ impl ExtProcInstance {
 						if let Some(original_body) =
 							BufferedBodyPhase::take_deferred_body(&mut pending_buffered_body)
 						{
-							let (parts, _) = req.into_parts();
-							let req = http::Request::from_parts(parts, original_body);
+							req.body_mut().restore_content(original_body);
 							debug_assert_preserved_request_body(
 								&req,
 								had_body,
@@ -1209,6 +1312,7 @@ impl ExtProcInstance {
 						Some(request_trailers.clone()),
 						first_message,
 						"request body should be available before streaming continuation starts",
+						None,
 					);
 					self.mark_protocol_config_sent_if(sends_protocol_config);
 				}
@@ -1228,7 +1332,7 @@ impl ExtProcInstance {
 							};
 							if let Some(resp) = to_immediate_response(&presp) {
 								trace!("got immediate response during request body streaming");
-								*immediate_response.lock().unwrap() = resp.direct_response;
+								*immediate_response.lock().unwrap() = Some(resp);
 								return;
 							}
 							let response = handle_response_for_request_mutation(
@@ -1416,20 +1520,23 @@ impl ExtProcInstance {
 		response: http::Response,
 		request: Option<&RequestSnapshot>,
 		resolved_destination_metadata: Option<SocketAddr>,
-	) -> Result<(http::Response, Option<PolicyResponse>), Error> {
-		let rebuffer = response.extensions().get::<cel::BufferedBody>().is_some();
-		let (mut response, policy_response) = self
-			.mutate_response_inner(response, request, resolved_destination_metadata)
-			.await?;
-		if rebuffer && self.mode_state.response_body_mode != BodySendMode::None {
-			let body = http::inspect_response_body(&mut response)
-				.await
-				.map_err(|error| Error::BodyBuffer(error.to_string()))?;
-			response
-				.extensions_mut()
-				.insert(cel::BufferedBody::from(body));
+	) -> Result<(http::Response, Option<http::Response>), Error> {
+		let cancel_on_drop = self.cancel.clone().drop_guard();
+		let result: Result<_, Error> = async {
+			let rebuffer = response.body().needs_inspection();
+			let (mut response, policy_response) = self
+				.mutate_response_inner(response, request, resolved_destination_metadata)
+				.await?;
+			if rebuffer && self.mode_state.response_body_mode != BodySendMode::None {
+				let _ = http::inspect_response_body(&mut response)
+					.await
+					.map_err(|error| Error::BodyBuffer(error.to_string()))?;
+			}
+			Ok((response, policy_response))
 		}
-		Ok((response, policy_response))
+		.await;
+		cancel_on_drop.disarm();
+		result
 	}
 
 	async fn mutate_response_inner(
@@ -1437,43 +1544,52 @@ impl ExtProcInstance {
 		response: http::Response,
 		request: Option<&RequestSnapshot>,
 		resolved_destination_metadata: Option<SocketAddr>,
-	) -> Result<(http::Response, Option<PolicyResponse>), Error> {
+	) -> Result<(http::Response, Option<http::Response>), Error> {
 		if self.skipped {
+			return Ok((response, None));
+		}
+		if self.cleanly_closed.load(Ordering::Relaxed) {
+			self.skipped = true;
 			return Ok((response, None));
 		}
 		let response_trailers = Arc::new(Mutex::new(None));
 		let headers = resp_to_header_map(&response);
 		let send_response_headers = self.mode_state.response_header_mode == HeaderSendMode::Send;
-
-		let exec = cel::Executor::new_response(request, &response);
-		self.ensure_stream_started(&exec)?;
-		// Wrap metadata_context in Arc for cheap cloning across body chunks
-		let metadata_context = if self.metadata_context.is_none()
-			&& let Some(rd) = resolved_destination_metadata
-		{
-			Some(Arc::new(Metadata {
-				filter_metadata: HashMap::from([(
-					// This is gross, but the GIE project unfairly favors Envoy, so we have to adapt to its limitations.
-					"envoy.lb".to_string(),
-					serde_json::from_value(serde_json::json!({"x-gateway-destination-endpoint-served": rd}))
+		// Drop the executor before the first await so the response future does not store it.
+		let (metadata_context, attributes) = {
+			let exec = cel::Executor::new_response(request, &response);
+			self.ensure_stream_started(&exec)?;
+			// Wrap metadata_context in Arc for cheap cloning across body chunks
+			let metadata_context = if self.metadata_context.is_none()
+				&& let Some(rd) = resolved_destination_metadata
+			{
+				Some(Arc::new(Metadata {
+					filter_metadata: HashMap::from([(
+						// This is gross, but the GIE project unfairly favors Envoy, so we have to adapt to its limitations.
+						"envoy.lb".to_string(),
+						serde_json::from_value(
+							serde_json::json!({"x-gateway-destination-endpoint-served": rd}),
+						)
 						.unwrap(),
-				)]),
-			}))
-		} else {
-			build_processing_metadata_context(&exec, self.metadata_context.as_ref())
-				.map(|filter_metadata| Arc::new(Metadata { filter_metadata }))
+					)]),
+				}))
+			} else {
+				build_processing_metadata_context(&exec, self.metadata_context.as_ref())
+					.map(|filter_metadata| Arc::new(Metadata { filter_metadata }))
+			};
+			// response_attributes should only be sent on first ProcessingRequest
+			// this will need to be modified if we configure which Requests to send
+			let attributes = self
+				.resp_attributes
+				.as_ref()
+				.and_then(|attrs| {
+					eval_to_struct(&exec, attrs)
+						.map(|v| HashMap::from([(EXTPROC_ATTRIBUTES_NAMESPACE.to_string(), v)]))
+						.ok()
+				})
+				.unwrap_or_default();
+			(metadata_context, attributes)
 		};
-		// response_attributes should only be sent on first ProcessingRequest
-		// this will need to be modified if we configure which Requests to send
-		let attributes = self
-			.resp_attributes
-			.as_ref()
-			.and_then(|attrs| {
-				eval_to_struct(&exec, attrs)
-					.map(|v| HashMap::from([(EXTPROC_ATTRIBUTES_NAMESPACE.to_string(), v)]))
-					.ok()
-			})
-			.unwrap_or_default();
 		let max_response_bytes = http::response_buffer_limit(&response);
 		let (parts, body) = response.into_parts();
 		let end_of_stream = body.is_end_stream();
@@ -1509,6 +1625,9 @@ impl ExtProcInstance {
 					observability_mode: false,
 				})
 				.await?;
+			if self.skipped {
+				return Ok((http::Response::from_parts(parts, body), None));
+			}
 			self.mark_protocol_config_sent_if(sends_protocol_config);
 		}
 
@@ -1517,12 +1636,17 @@ impl ExtProcInstance {
 		}
 
 		let tx = self.tx_req.clone();
-		let mut pending_response_body = Some(body);
+		let mut managed_body = body;
+		let mut pending_response_body = Some(managed_body.take_content());
 		let mut pending_response_buffer = None;
 		// Now we need to build the new body. This is going to be streamed in from the ext_proc server.
 		let (mut tx_chunk, rx_chunk) = tokio::sync::mpsc::channel(1);
 		let body = http_body_util::StreamBody::new(ReceiverStream::new(rx_chunk));
-		let mut resp = http::Response::from_parts(parts, http::Body::new(body));
+		managed_body.replace_content(agent_http::RawBody::new(body).into());
+		let (tx_downstream_dropped, rx_downstream_dropped) = tokio::sync::oneshot::channel::<()>();
+		let mut rx_downstream_dropped = Some(rx_downstream_dropped);
+		let mut resp =
+			http::Response::from_parts(parts, managed_body.with_drop_guard(tx_downstream_dropped));
 
 		// FULL_DUPLEX_STREAMED sends response body chunks as they arrive. The ext_proc server may
 		// buffer the response headers and complete body before sending any response, so do not wait
@@ -1542,6 +1666,7 @@ impl ExtProcInstance {
 				Some(response_trailers.clone()),
 				first_message,
 				"response body should be available before streaming starts",
+				rx_downstream_dropped.take(),
 			);
 			self.mark_protocol_config_sent_if(sends_protocol_config);
 		} else if !send_response_headers && had_body {
@@ -1575,6 +1700,7 @@ impl ExtProcInstance {
 					Some(response_trailers.clone()),
 					first_message,
 					"response body should be available before streaming starts",
+					rx_downstream_dropped.take(),
 				);
 				self.mark_protocol_config_sent_if(sends_protocol_config);
 			}
@@ -1656,12 +1782,12 @@ impl ExtProcInstance {
 						if let Some(original_body) =
 							BufferedBodyPhase::take_deferred_body(&mut pending_response_buffer)
 						{
-							let (parts, _) = resp.into_parts();
-							return Ok((http::Response::from_parts(parts, original_body), None));
+							resp.body_mut().restore_content(original_body);
+							return Ok((resp, None));
 						}
 						if let Some(original_body) = pending_response_body.take() {
-							let (parts, _) = resp.into_parts();
-							return Ok((http::Response::from_parts(parts, original_body), None));
+							resp.body_mut().restore_content(original_body);
+							return Ok((resp, None));
 						}
 					},
 					_ => {},
@@ -1691,6 +1817,7 @@ impl ExtProcInstance {
 							Some(response_trailers.clone()),
 							first_message,
 							"response body should be available before streaming continuation starts",
+							rx_downstream_dropped.take(),
 						);
 						self.mark_protocol_config_sent_if(sends_protocol_config);
 					}

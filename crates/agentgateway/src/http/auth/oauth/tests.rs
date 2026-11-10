@@ -801,6 +801,7 @@ fn private_key_jwt_debug_redacts_key_and_certificate() {
 
 #[test]
 fn private_key_jwt_sets_x5t_s256_header() {
+	crate::crypto::jwt::init();
 	let private_key = serde_json::from_value::<PrivateKeyJwt>(json!({
 		"signingKey": TEST_EC_PRIVATE_KEY_PEM,
 		"certificate": TEST_EC_CERT_PEM,
@@ -821,6 +822,7 @@ fn private_key_jwt_sets_x5t_s256_header() {
 
 #[test]
 fn private_key_jwt_signs_with_ps256() {
+	crate::crypto::jwt::init();
 	let signing_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256).unwrap();
 	let public_key = signing_key.public_key_pem();
 	let private_key = PrivateKeyJwt::try_from(RawPrivateKeyJwt {
@@ -1358,6 +1360,7 @@ fn cross_app_access_from_proto_derives_oauth_chain(
 				token_type: token_type.to_string(),
 			}),
 			cache: None,
+			translation_error: None,
 		},
 		&mut Diagnostics::default(),
 	)
@@ -2655,4 +2658,44 @@ async fn dispatch_removes_input_token_locations_before_inserting_output() {
 			.unwrap(),
 		"upstream-token"
 	);
+}
+
+#[rstest]
+#[case::past(|now| Some(json!(now - 30)), true)]
+#[case::past_fractional(|now| Some(json!(now as f64 - 30.5)), true)]
+#[case::exactly_now(|now| Some(json!(now)), true)]
+#[case::future(|now| Some(json!(now + 600)), false)]
+#[case::future_fractional(|now| Some(json!(now as f64 + 600.5)), false)]
+#[case::missing_exp(|_| None, false)]
+#[case::nonnumeric_exp(|_| Some(json!("expired")), false)]
+fn rejects_only_expired_jwt_subject_tokens(
+	#[case] exp: fn(u64) -> Option<serde_json::Value>,
+	#[case] rejected: bool,
+) {
+	let auth = auth(Arc::new(SimpleBackendReference::Invalid));
+	let mut req = incoming_request();
+	let mut payload = serde_json::Map::new();
+	if let Some(exp) = exp(jsonwebtoken::get_current_timestamp()) {
+		payload.insert("exp".into(), exp);
+	}
+	let token =
+		crate::http::jwt::tests::build_signed_token_with_payload("untrusted-key", payload.into());
+	req.headers_mut().insert(
+		::http::header::AUTHORIZATION,
+		format!("Bearer {token}").parse().unwrap(),
+	);
+	let result = auth.build_exchange_request(&req);
+	if rejected {
+		assert!(matches!(result, Err(ProxyError::JwtAuthenticationFailure(
+			crate::http::jwt::TokenError::Invalid(ref error)))
+			if *error.kind() == jsonwebtoken::errors::ErrorKind::ExpiredSignature));
+	} else {
+		assert!(result.is_ok());
+	}
+}
+
+#[test]
+fn allows_opaque_subject_token() {
+	let auth = auth(Arc::new(SimpleBackendReference::Invalid));
+	assert!(auth.build_exchange_request(&incoming_request()).is_ok());
 }

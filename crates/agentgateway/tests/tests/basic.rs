@@ -584,6 +584,93 @@ async fn basic_http2() {
 	assert_eq!(read_body(res.into_body()).await.version, Version::HTTP_2);
 }
 
+#[rstest::rstest]
+#[case::http1(Version::HTTP_11, Version::HTTP_11, false)]
+#[case::http2(Version::HTTP_2, Version::HTTP_2, false)]
+#[case::http2_to_http1(Version::HTTP_2, Version::HTTP_11, false)]
+#[case::http1_to_http2(Version::HTTP_11, Version::HTTP_2, false)]
+#[case::http2_content_length(Version::HTTP_2, Version::HTTP_2, true)]
+#[case::http2_to_http1_content_length(Version::HTTP_2, Version::HTTP_11, true)]
+#[tokio::test]
+async fn request_trailers(
+	#[case] version: Version,
+	#[case] backend_version: Version,
+	#[case] content_length: bool,
+) {
+	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let addr = listener.local_addr().unwrap();
+	let (tx, rx) = oneshot::channel();
+	let tx = Arc::new(StdMutex::new(Some(tx)));
+	let server = tokio::spawn(async move {
+		let (stream, _) = listener.accept().await.unwrap();
+		let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+			let tx = tx.clone();
+			async move {
+				let (parts, body) = req.into_parts();
+				let body = body.collect().await.unwrap();
+				let trailers = body.trailers().cloned();
+				tx.lock()
+					.unwrap()
+					.take()
+					.unwrap()
+					.send((parts, body.to_bytes(), trailers))
+					.unwrap();
+				Ok::<_, Infallible>(hyper::Response::new(Body::empty()))
+			}
+		});
+		hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+			.serve_connection(TokioIo::new(stream), svc)
+			.await
+			.unwrap();
+	});
+	let t = setup_proxy_test("{}")
+		.unwrap()
+		.with_raw_backend(BackendWithPolicies {
+			backend: Backend::Opaque(
+				ResourceName::new(strng::format!("{}", addr), "".into()),
+				Target::Address(addr),
+			),
+			inline_policies: vec![BackendTrafficPolicy::HTTP(backend::HTTP {
+				version: Some(backend_version),
+				..Default::default()
+			})],
+		})
+		.with_bind(simple_bind())
+		.with_route(basic_route(addr));
+	let io = if version == Version::HTTP_2 {
+		t.serve_http2(BIND_KEY)
+	} else {
+		t.serve_http(BIND_KEY)
+	};
+	let mut trailers = HeaderMap::new();
+	trailers.insert("x-input-trailer", "input-done".parse().unwrap());
+	let body = Body::new(StreamBody::new(tokio_stream::iter([
+		Ok::<_, Infallible>(Frame::data(bytes::Bytes::from_static(b"grpc-payload"))),
+		Ok(Frame::trailers(trailers.clone())),
+	])));
+	let mut request = RequestBuilder::new(Method::POST, "http://lo")
+		.version(version)
+		.header(header::TRAILER, "x-input-trailer")
+		.body(body);
+	if content_length {
+		request = request.header(header::CONTENT_LENGTH, "12");
+	}
+	let res = request.send(io).await.unwrap();
+	assert_eq!(res.status(), 200);
+	let (parts, bytes, received_trailers) = rx.await.unwrap();
+	server.abort();
+	assert_eq!(parts.version, backend_version);
+	assert_eq!(parts.headers.get_all(header::TRAILER).iter().count(), 1);
+	if backend_version == Version::HTTP_11 {
+		assert!(!parts.headers.contains_key(header::CONTENT_LENGTH));
+		assert_eq!(parts.headers[header::TRANSFER_ENCODING], "chunked");
+	} else if content_length {
+		assert_eq!(parts.headers[header::CONTENT_LENGTH], "12");
+	}
+	assert_eq!(bytes, "grpc-payload");
+	assert_eq!(received_trailers, Some(trailers));
+}
+
 #[tokio::test]
 async fn http2_host_header_without_authority() {
 	let mock = simple_mock().await;
@@ -608,6 +695,85 @@ async fn http2_host_header_without_authority() {
 	assert_eq!(response.await.unwrap().status(), 200);
 
 	connection.abort();
+}
+
+#[rstest::rstest]
+#[case(false)]
+#[case(true)]
+#[tokio::test]
+async fn grpc_bidirectional_stream_half_close(#[case] retry: bool) {
+	use futures_util::StreamExt;
+	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let backend = listener.local_addr().unwrap();
+	let server = tokio::spawn(async move {
+		let (stream, _) = listener.accept().await.unwrap();
+		let svc = service_fn(|req: hyper::Request<hyper::body::Incoming>| async move {
+			let mut trailers = HeaderMap::new();
+			trailers.insert("grpc-status", "0".parse().unwrap());
+			let body = StreamBody::new(
+				req
+					.into_body()
+					.into_stream()
+					.chain(tokio_stream::iter([Ok(Frame::trailers(trailers))])),
+			);
+			Ok::<_, Infallible>(
+				::http::Response::builder()
+					.header(header::CONTENT_TYPE, "application/grpc")
+					.body(body)
+					.unwrap(),
+			)
+		});
+		hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+			.serve_connection(TokioIo::new(stream), svc)
+			.await
+			.unwrap();
+	});
+	let mut t = setup_proxy_test("{}")
+		.unwrap()
+		.with_raw_backend(BackendWithPolicies {
+			backend: Backend::Opaque(
+				ResourceName::new(strng::format!("{}", backend), "".into()),
+				Target::Address(backend),
+			),
+			inline_policies: vec![BackendTrafficPolicy::HTTP(backend::HTTP {
+				version: Some(Version::HTTP_2),
+				..Default::default()
+			})],
+		})
+		.with_bind(simple_bind())
+		.with_route(basic_route(backend));
+	if retry {
+		t.attach_route_policy(json!({"retry": {"attempts": 2, "codes": [503]}}))
+			.await;
+	}
+	let (mut client, connection) = h2::client::handshake(t.serve(BIND_KEY)).await.unwrap();
+	let connection = tokio::spawn(connection);
+	let request = ::http::Request::builder()
+		.method(Method::POST)
+		.uri("http://lo/echo.Echo/Bidi")
+		.header(header::CONTENT_TYPE, "application/grpc")
+		.body(())
+		.unwrap();
+	let (response, mut send) = client.send_request(request, false).unwrap();
+	tokio::time::timeout(Duration::from_secs(5), async {
+		let mut recv = response.await.unwrap().into_body();
+		for i in 0..3 {
+			let message = bytes::Bytes::from(vec![0, 0, 0, 0, 1, i]);
+			send.send_data(message.clone(), false).unwrap();
+			assert_eq!(recv.data().await.unwrap().unwrap(), message);
+			recv.flow_control().release_capacity(message.len()).unwrap();
+		}
+		// grpc-go's CloseSend ends the request with an empty DATA frame.
+		send.send_data(bytes::Bytes::new(), true).unwrap();
+		while let Some(data) = recv.data().await {
+			assert!(data.unwrap().is_empty());
+		}
+		assert_eq!(recv.trailers().await.unwrap().unwrap()["grpc-status"], "0");
+	})
+	.await
+	.expect("bidirectional stream must finish after the request ends");
+	connection.abort();
+	server.abort();
 }
 
 async fn grpc_trailer_backend(status: &'static str) -> std::net::SocketAddr {

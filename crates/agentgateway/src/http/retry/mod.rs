@@ -1,6 +1,5 @@
 mod body;
 
-use std::num::NonZeroU8;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,13 +12,9 @@ use crate::*;
 #[apply(schema!)]
 #[cfg_attr(feature = "schema", schemars(rename = "RetryPolicy"))]
 pub struct Policy {
-	/// Total number of attempts, including the original request.
+	/// Maximum number of retries after the original request. `0` disables retries.
 	#[serde(default = "default_attempts")]
-	pub attempts: NonZeroU8,
-	/// Maximum request-body size buffered for replay. When unset, the proxy
-	/// retains its conservative default replay limit.
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub max_buffer_size: Option<usize>,
+	pub attempts: u8,
 	/// Delay between retry attempts.
 	#[serde(
 		default,
@@ -67,8 +62,8 @@ where
 		.collect::<Result<Vec<_>, _>>()?;
 	Ok(boxed.into_boxed_slice())
 }
-fn default_attempts() -> NonZeroU8 {
-	NonZeroU8::new(1).unwrap()
+fn default_attempts() -> u8 {
+	1
 }
 
 #[cfg(test)]
@@ -79,14 +74,12 @@ mod tests {
 	fn parses_pre_and_post_conditions() {
 		let pol: Policy = serde_json::from_value(serde_json::json!({
 			"attempts": 3,
-			"maxBufferSize": 1024,
 			"codes": [503],
 			"precondition": "request.method == \"GET\"",
 			"condition": "response.headers[\"x-req-failed\"] != \"\"",
 		}))
 		.unwrap();
-		assert_eq!(pol.attempts.get(), 3);
-		assert_eq!(pol.max_buffer_size, Some(1024));
+		assert_eq!(pol.attempts, 3);
 		assert_eq!(
 			pol.precondition.as_ref().unwrap().original_expression,
 			"request.method == \"GET\""

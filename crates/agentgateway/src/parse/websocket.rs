@@ -61,7 +61,9 @@ impl<IO> Parser<IO> {
 				// also, the model can change... so what do we report??
 				self.log.non_atomic_mutate(|r| {
 					r.response = LLMResponse {
-						failed: false,
+						cache_creation_1h_input_tokens: None,
+						cache_creation_12h_input_tokens: None,
+						usage_lines: Vec::new(),
 						input_tokens: Some(usage.input_tokens as u64),
 						input_image_tokens: None,
 						input_text_tokens: None,
@@ -79,6 +81,8 @@ impl<IO> Parser<IO> {
 						last_token_at: None,
 						inter_chunk_latencies: TokenGapSummary::default(),
 						count_tokens: None,
+						pages: None,
+						audio_seconds: None,
 						reasoning_tokens: None,
 						cache_creation_input_tokens: None,
 						cached_input_tokens: usage
@@ -279,9 +283,11 @@ impl WsFrameAccumulator {
 
 	fn drain_frames(&mut self) -> Vec<WsCompletedFrame> {
 		let mut result = Vec::new();
+		// The decoder unmasks payloads in place; preserve pending for raw forwarding.
+		let mut copy = self.pending.to_vec();
+		let mut remaining = copy.as_mut_slice();
 		loop {
-			let mut copy = self.pending.to_vec();
-			let ret = match self.decoder.add_data(&mut copy) {
+			let ret = match self.decoder.add_data(remaining) {
 				Ok(r) => r,
 				Err(_) => {
 					// Protocol error: forward all pending raw bytes as an opaque frame and
@@ -309,7 +315,7 @@ impl WsFrameAccumulator {
 				}) => {
 					self
 						.frame_payload
-						.extend_from_slice(&copy[..ret.consumed_bytes]);
+						.extend_from_slice(&remaining[..ret.consumed_bytes]);
 				},
 				Some(WebsocketFrameEvent::End {
 					original_opcode: Opcode::Text,
@@ -317,7 +323,7 @@ impl WsFrameAccumulator {
 				}) => {
 					self
 						.frame_payload
-						.extend_from_slice(&copy[..ret.consumed_bytes]);
+						.extend_from_slice(&remaining[..ret.consumed_bytes]);
 					let raw = self.frame_raw.split().freeze();
 					let payload = self.frame_payload.split().freeze();
 					result.push(WsCompletedFrame::Text { raw, payload });
@@ -331,6 +337,7 @@ impl WsFrameAccumulator {
 				| Some(WebsocketFrameEvent::Start { .. })
 				| None => {},
 			}
+			remaining = &mut remaining[ret.consumed_bytes..];
 		}
 		result
 	}
@@ -543,7 +550,9 @@ pub async fn guarded_realtime_proxy<C, S>(
 										let usage_clone = usage.clone();
 										log_clone.non_atomic_mutate(|r| {
 											r.response = LLMResponse {
-												failed: false,
+												cache_creation_1h_input_tokens: None,
+												cache_creation_12h_input_tokens: None,
+												usage_lines: Vec::new(),
 												input_tokens: Some(usage_clone.input_tokens as u64),
 												input_image_tokens: None,
 												input_text_tokens: None,
@@ -561,6 +570,8 @@ pub async fn guarded_realtime_proxy<C, S>(
 												last_token_at: None,
 												inter_chunk_latencies: TokenGapSummary::default(),
 												count_tokens: None,
+												pages: None,
+												audio_seconds: None,
 												reasoning_tokens: None,
 												cache_creation_input_tokens: None,
 												cached_input_tokens: usage_clone
