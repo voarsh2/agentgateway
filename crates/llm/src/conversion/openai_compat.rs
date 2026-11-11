@@ -144,16 +144,14 @@ pub mod from_responses {
 					},
 					ResponsesRole::System | ResponsesRole::Developer => {
 						let content = match msg.content {
-							EasyInputContent::Text(text) => {
-								completions::RequestDeveloperMessageContent::Text(text)
-							},
+							EasyInputContent::Text(text) => completions::RequestSystemMessageContent::Text(text),
 							EasyInputContent::ContentList(parts) => {
-								completions::RequestDeveloperMessageContent::Array(
+								completions::RequestSystemMessageContent::Array(
 									parts
 										.into_iter()
 										.filter_map(|part| match part {
 											InputContent::InputText(text) => {
-												Some(completions::RequestDeveloperMessageContentPart::Text(
+												Some(completions::RequestSystemMessageContentPart::Text(
 													completions::RequestMessageContentPartText {
 														text: text.text,
 														prompt_cache_breakpoint: cache_breakpoint(text.prompt_cache_breakpoint),
@@ -166,8 +164,8 @@ pub mod from_responses {
 								)
 							},
 						};
-						messages.push(completions::RequestMessage::Developer(
-							completions::RequestDeveloperMessage {
+						messages.push(completions::RequestMessage::System(
+							completions::RequestSystemMessage {
 								content,
 								name: None,
 							},

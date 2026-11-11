@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use serde_json::{Value, json};
 
-use super::to_responses;
+use super::{from_responses, to_responses};
 
 fn translate(input: &[u8]) -> Value {
 	let response =
@@ -9,6 +9,30 @@ fn translate(input: &[u8]) -> Value {
 			.expect("Chat Completions response should translate");
 	serde_json::from_slice(&response.serialize().expect("response should serialize"))
 		.expect("translated response should be JSON")
+}
+
+#[test]
+fn responses_system_and_developer_messages_use_chat_system_role() {
+	let request: crate::types::responses::Request = serde_json::from_value(json!({
+		"model": "glm-5.3",
+		"instructions": "top-level instructions",
+		"input": [
+			{"role": "system", "content": "easy system message"},
+			{"role": "developer", "content": "easy developer message"},
+			{
+				"type": "message",
+				"role": "developer",
+				"content": [{"type": "input_text", "text": "typed developer message"}]
+			}
+		]
+	}))
+	.unwrap();
+
+	let translated = from_responses::translate_request(&request).unwrap();
+	let value = serde_json::to_value(&translated.request).unwrap();
+	let messages = value["messages"].as_array().unwrap();
+	assert_eq!(messages.len(), 4);
+	assert!(messages.iter().all(|message| message["role"] == "system"));
 }
 
 #[test]
